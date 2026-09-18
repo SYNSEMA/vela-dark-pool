@@ -1,5 +1,5 @@
--- web.syn — the auction console: the seller offers a block of the stack's token for ETH, bidders
--- send sealed bids, the seller closes, and each side sees only what is theirs — from the browser.
+-- web.syn — the dark pool console: the seller offers a block of the stack's token for ETH, buyers
+-- send sealed orders, the seller closes, and each side sees only what is theirs — from the browser.
 -- This is the recipe's entry on the Synsema platform (kind = web). On a devnet the console plays
 -- every side: the seller's desk (the .env key) and a desk per bidder it created — a wallet it
 -- custodies, given some ETH from the seller's wallet — and the enclave treats those bidders exactly
@@ -10,7 +10,7 @@
 -- Every action is one request to the enclave: 30 to 60 seconds on a devnet.
 --
 --   synsema serve web.syn            (from the repository root; .env there = `vela_client.syn -- devnet`)
-intent: "auction console: a sealed-bid auction on Vela from the browser — the seller's desk and a desk per bidder"
+intent: "dark pool console: sealed orders matched inside the enclave on Vela, from the browser — the seller's desk and a desk per buyer"
 
 require serve(8080)
 require net("localhost")

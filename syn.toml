@@ -1,18 +1,18 @@
-# A sealed-bid auction on Vela (Horizen) as a recipe: the entry is the auction console (web.syn), a
+# A dark pool on Vela (Horizen) as a recipe: the entry is the trading console (web.syn), a
 # web app that embeds app/app.syn into the release's guest module, deploys it to Vela and runs the
 # auction from the browser: the seller's desk and a desk per bidder it sets up on a devnet. This file
 # only says what the code cannot say about itself; the `require` blocks are the manifests of
 # capabilities. The command-line client in client/ does the same from a terminal, one party per .env.
 
-name = "Sealed-bid auction on Vela"
-slug = "vela-auction"
-version = "0.2.4"
+name = "Dark pool"
+slug = "vela-dark-pool"
+version = "0.3.0"
 kind = "web"
 entry = "web.syn"
 engine = "0.6"
-tagline = "A sealed-bid auction on Horizen's Vela, in Synsema: encrypted bids, matching inside the enclave, settlement from escrow; losing bids are never revealed."
-tagline_es = "Subasta de sobre cerrado en Vela (Horizen) con Synsema: pujas cifradas, matching dentro del enclave, liquidación desde el escrow; las pujas perdedoras nunca se revelan."
-tagline_pt = "Leilão de lance selado no Vela (Horizen) com Synsema: lances cifrados, casamento dentro do enclave, liquidação do escrow; lances perdedores nunca são revelados."
+tagline = "A dark pool for block trades on Horizen's Vela, in Synsema: orders go in encrypted, the enclave matches them, settlement comes from escrow; nobody sees the book, and losing orders are never revealed."
+tagline_es = "Un dark pool para operaciones en bloque en Vela (Horizen) con Synsema: las órdenes entran cifradas, el enclave las cruza, la liquidación sale del escrow; nadie ve el libro y las órdenes perdedoras nunca se revelan."
+tagline_pt = "Um dark pool para operações em bloco no Vela (Horizen) com Synsema: as ordens entram cifradas, o enclave as cruza, a liquidação sai do escrow; ninguém vê o livro e as ordens perdedoras nunca são reveladas."
 
 [secrets]
 VELA_SECP_KEY = "the seller's secp256k1 key: signs the transactions and pays the fees (hex). On the public devnet the token comes with an account of its own: a deployer with ETH and test tokens, whose wallet also funds the demo bidders."

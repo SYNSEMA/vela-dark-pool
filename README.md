@@ -1,10 +1,12 @@
-# vela-auction — a sealed-bid auction on Vela (Horizen), in Synsema
+# vela-dark-pool — a dark pool for block trades on Vela (Horizen), in Synsema
 
-A seller offers a block of one token for another: an OTC block, a token sale, a bill. Bidders
-deposit the payment token and send their bids **encrypted to the enclave**. Nobody — not the other
-bidders, not the seller — sees a bid before the close. The matching runs inside, deterministically;
-winners and losers are settled from their escrow; the losing bids are never revealed to anyone.
-The chain sees that an auction opened and what it cleared at, never who bid what.
+A dark pool: orders nobody sees, so nothing to front-run. A seller offers a block of one token for
+another (an OTC block, a token sale, a bill); buyers deposit the payment token and send their orders
+**encrypted to the enclave**. Nobody — not the other buyers, not the seller — sees an order before
+the close. The matching runs inside, deterministically; winners and losers are settled from their
+escrow; the losing orders are never revealed to anyone. The chain sees that a block was offered and
+what it cleared at, never who bid what. Mechanically it is a sealed-bid batch auction (uniform price
+or pay-as-bid), which is what the code calls it: `open`, `bid`, `close`.
 
 ```
 seller ───open (asset, quantity, payment, reserve, kind)──▶ ┌────────── enclave ──────────┐──▶ chain: opened(id, asset, quantity, payment, kind)
