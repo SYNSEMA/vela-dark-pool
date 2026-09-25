@@ -26,8 +26,8 @@ otherwise
 
 task fake_module(program)
     let n be bytes("app.syn")
-    let header be bytes("SYNSEMA.APPSLOT1") + bytes([length(n)]) + n + int_to_bytes(0, 63 - length(n)) + slot.u32_le(length(bytes(program)))
-    let padding be int_to_bytes(0, 524288 - 84 - length(bytes(program)))
+    let header be bytes("SYNSEMA.APPSLOT1") + bytes([length(n)]) + n + slot.fill(63 - length(n)) + slot.u32_le(length(bytes(program)))
+    let padding be slot.fill(524288 - 84 - length(bytes(program)))
     give bytes("\u0000asm\u0001\u0000\u0000\u0000 before ") + header + bytes(program) + padding + bytes(" after")
 
 test "u32 little-endian"
@@ -46,3 +46,8 @@ test "no slot, two slots, or a program that does not fit are clear errors"
     let m be fake_module("x")
     assert_error(() => slot.slot_offset(m + m))
     assert_error(() => slot.embed(m, decode(int_to_bytes(0, 524288), "hex"), "big.syn"))
+
+test "embed writes byte for byte what build.rs writes for the same program (the filler is 0x20)"
+    assert_eq(slot.fill(3), bytes([32, 32, 32]))
+    let other be "-- another program; the 0x20 filler follows it"
+    assert_eq(slot.embed(fake_module("x"), other, "app.syn"), fake_module(other))

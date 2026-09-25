@@ -1,7 +1,7 @@
 -- embed_lib.syn — the app slot of a Vela guest module, as a module: `scripts/embed.syn` (the
 -- command) and a kit's web app (which downloads the release's guest and embeds the program at first
 -- deploy) both `use` it. Layout of the slot (524 288 bytes): magic (16) · name length (1) · name (63) ·
--- program length as u32 little-endian (4) · the program, UTF-8 · padding. Programs up to 524 204 bytes.
+-- program length as u32 little-endian (4) · the program, UTF-8 · 0x20 filler to the end. Programs up to 524 204 bytes.
 
 let MAGIC be "SYNSEMA.APPSLOT1"
 let SLOT be 524288
@@ -25,6 +25,15 @@ export task slot_offset(wasm)
         raise("the app slot is not byte-aligned; refusing to guess")
     give floor(length(parts[0]) / 2)
 
+-- n bytes of 0x20: the filler build.rs uses, byte for byte, after the name and after the program.
+-- Not zero on purpose — a long run of zeros could land in .bss or in a split segment, and the
+-- slot must stay ONE contiguous run of bytes in the file. Doubling: ~20 steps for a whole slot.
+export task fill(n)
+    let s be bytes(" ")
+    while length(s) < n
+        set s to s + s
+    give slice(s, 0, n)
+
 export task embed(wasm, program, name)
     let off be slot_offset(wasm)
     when off + SLOT > length(wasm)
@@ -35,8 +44,8 @@ export task embed(wasm, program, name)
     let n be bytes(name)
     when length(n) > 63
         set n to slice(n, 0, 63)
-    let header be bytes(MAGIC) + bytes([length(n)]) + n + int_to_bytes(0, 63 - length(n)) + u32_le(length(body))
-    let slot be header + body + int_to_bytes(0, SLOT - HEADER - length(body))
+    let header be bytes(MAGIC) + bytes([length(n)]) + n + fill(63 - length(n)) + u32_le(length(body))
+    let slot be header + body + fill(SLOT - HEADER - length(body))
     give slice(wasm, 0, off) + slot + slice(wasm, off + SLOT, length(wasm))
 
 -- The guest module of a Synsema release, downloaded (GitHub answers with a redirect to its object

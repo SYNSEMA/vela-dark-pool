@@ -361,7 +361,9 @@ export task submit_for_with(c, ukey, request_type, payload, token, asset_amount)
     let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
     let chain_id be eth_chain_id(c["rpc"])
     let deadline be floor(now()) + 3600
-    let nonce be call_uint(c, processor, "getFacilitatorNonce(address)", [user])
+    -- facilitatorNonces(address) is the public mapping's getter: it exists in v0.2.0 and in v0.3.0,
+    -- where getFacilitatorNonce(address) is removed (Vela CHANGELOG, breaking changes).
+    let nonce be call_uint(c, processor, "facilitatorNonces(address)", [user])
     let authorization be eth_signature(authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline), ukey)
     let permit be bytes([])
     when asset_amount > 0

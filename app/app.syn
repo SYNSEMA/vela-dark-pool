@@ -27,6 +27,8 @@ intent: "vela app: sealed-bid auction — encrypted bids, matching inside the en
 let ETH be "0x0000000000000000000000000000000000000000"
 let MAX_BIDS be 200
 let MAX_CLOSED be 100
+-- One fuel for every entry point: a per-branch value (5/35/50/80) would name the instruction on-chain.
+let FUEL be "80"
 
 task hex_of(b)
     give "0x" + decode(b, "hex")
@@ -47,7 +49,9 @@ task int_of(t)
     let s be trim(text(t))
     when s == "" or not matches(s, "[0-9]+")
         raise("not an amount: " + s)
-    let n be 0
+    -- The digits come from private amounts: the accumulator is born private (the result is
+    -- declassified where it becomes public, never here).
+    let n be private(0, "app")
     each ch in split(s, "")
         set n to n * 10 + floor(number(ch))
     give n
@@ -85,7 +89,9 @@ task balance_of(state, account, token)
 
 task set_balance(state, account, token, amount)
     let balances be state["balances"]
-    let mine be when contains(balances, account) then balances[account] otherwise {}
+    -- A brand-new row is born private: it is about to hold a balance, and a public container
+    -- cannot take a private write (the position itself would leak).
+    let mine be when contains(balances, account) then balances[account] otherwise private({}, "app")
     set mine[token] to text(amount)
     set balances[account] to mine
     set state["balances"] to balances
@@ -115,24 +121,36 @@ task public_auction(a)
 
 -- ---- entry points ----
 
+-- No params, except an optional {"policy": {"reject": "private", "events_pad": 256, "events_min": 2}}:
+-- the output policy the adapter keeps inside the state (`_vela`). A rejected bid then looks like
+-- any other request on-chain and the bidder gets the reason encrypted.
 task deploy(ctx)
-    give {"state": new_state(ctx["app_id"]), "fuel": "5"}
+    let r be {"state": new_state(ctx["app_id"]), "fuel": FUEL}
+    when ctx["params"] != nothing and contains(ctx["params"], "policy") and ctx["params"]["policy"] != nothing
+        set r["policy"] to ctx["params"]["policy"]
+    give r
 
 task load_module(ctx)
-    give {"state": new_state(ctx["app_id"]), "fuel": "5"}
+    give {"state": new_state(ctx["app_id"]), "fuel": FUEL}
 
 task deposit(ctx)
     let token be lower(ctx["token"])
     let amount be int_of(ctx["value"])
     let s1 be bump(credit(ctx["state"], ctx["sender"], token, amount))
     let event be {"type": "deposit", "token": token, "amount": text(amount), "balance": text(balance_of(s1, ctx["sender"], token)), "nonce": s1["nonce"]}
-    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "fuel": "35"}
+    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "fuel": FUEL}
 
 task process(ctx)
     let payload be ctx["payload"]
     when payload == nothing or not contains(payload, "type")
-        give {"error": "payload needs a \"type\": open | bid | cancel_bid | close | cancel | withdraw"}
-    match payload["type"]
+        give {"error": declassify("missing_type", "the outcome code is public on-chain"), "error_detail": "payload needs a \"type\": open | bid | cancel_bid | close | cancel | withdraw"}
+    -- The payload is private, so branching on it labels everything this branch produces — and
+    -- that is fine: the adapter's root sink is {app}, and only the fields that really go on-chain
+    -- (the error code, a withdrawal, an app event) ask for a `declassify` of their own. The
+    -- dispatch is NOT declassified: the fee is uniform across every branch, so it does not reveal
+    -- the instruction, and nothing else here does either.
+    let kind be text(payload["type"])
+    match kind
         is "open"
             give open(ctx, ctx["state"], payload)
         is "bid"
@@ -146,28 +164,28 @@ task process(ctx)
         is "withdraw"
             give withdraw(ctx, ctx["state"], payload)
         otherwise
-            give {"error": "unsupported instruction type: " + text(payload["type"])}
+            give {"error": declassify("unknown_type", "the outcome code is public on-chain"), "error_detail": "unsupported instruction type: " + text(payload["type"])}
 
 -- The seller locks `quantity` of the asset and opens the book. The chain learns that an auction
 -- opened (asset, quantity, payment token, kind) — not who sells.
 task open(ctx, state, p)
     when not is_address(field(p, "asset", nothing)) or not is_address(field(p, "payment", nothing))
-        give {"error": "open needs the asset and the payment token addresses"}
+        give {"error": declassify("missing_tokens", "the outcome code is public on-chain"), "error_detail": "open needs the asset and the payment token addresses"}
     let asset be lower(p["asset"])
     let payment be lower(p["payment"])
     when asset == payment
-        give {"error": "the asset and the payment token must differ"}
+        give {"error": declassify("same_token", "the outcome code is public on-chain"), "error_detail": "the asset and the payment token must differ"}
     let quantity be int_of(field(p, "quantity", "0"))
     when quantity <= 0
-        give {"error": "quantity must be positive"}
+        give {"error": declassify("quantity_not_positive", "the outcome code is public on-chain"), "error_detail": "quantity must be positive"}
     let reserve be int_of(field(p, "reserve", "0"))
     let kind be text(field(p, "kind", "uniform"))
     when kind != "uniform" and kind != "pay_as_bid"
-        give {"error": "kind must be uniform or pay_as_bid"}
+        give {"error": declassify("unknown_kind", "the outcome code is public on-chain"), "error_detail": "kind must be uniform or pay_as_bid"}
     let seller be ctx["sender"]
     let have be balance_of(state, seller, asset)
     when have < quantity
-        give {"error": "the seller holds " + text(have) + " of the asset, the auction needs " + text(quantity)}
+        give {"error": declassify("insufficient_asset", "the outcome code is public on-chain"), "error_detail": "the seller holds " + text(have) + " of the asset, the auction needs " + text(quantity)}
     let s0 be prune(state)
     let n be s0["auction_nonce"] + 1
     set s0["auction_nonce"] to n
@@ -177,51 +195,51 @@ task open(ctx, state, p)
     let kind_code be when kind == "uniform" then 0 otherwise 1
     let call be abi_encode("opened(bytes16,address,uint256,address,uint8)", [int_to_bytes(n, 16), asset, quantity, payment, kind_code])
     let event be {"type": "opened", "auction": public_auction(a), "nonce": s1["nonce"]}
-    give {"state": s1, "events": [{"user": seller, "data": event}], "app_events": [{"subtype": "opened", "data_hex": hex_of(slice(call, 4, length(call)))}], "fuel": "50"}
+    give {"state": s1, "events": [{"user": seller, "data": event}], "app_events": [declassify({"subtype": "opened", "data_hex": hex_of(slice(call, 4, length(call)))}, "public opening receipt: (auction id, asset, quantity offered, payment token, pricing kind) — no price, no bidder; the seller is the visible submitter of the request either way")], "fuel": FUEL}
 
 -- A bid: `quantity` of the asset for `total` of the payment token, escrowed from the bidder's
 -- balance until the close. One live bid per bidder per auction: a new one replaces the old.
 task bid(ctx, state, p)
     let a be find_auction(state, p)
     when a == nothing
-        give {"error": "unknown auction " + text(field(p, "auction", ""))}
+        give {"error": declassify("unknown_auction", "the outcome code is public on-chain"), "error_detail": "unknown auction " + text(field(p, "auction", ""))}
     when a["status"] != "open"
-        give {"error": "auction " + a["id"] + " is " + a["status"]}
+        give {"error": declassify("auction_not_open", "the outcome code is public on-chain"), "error_detail": "auction " + a["id"] + " is " + a["status"]}
     let bidder be ctx["sender"]
     when bidder == a["seller"]
-        give {"error": "the seller cannot bid"}
+        give {"error": declassify("seller_cannot_bid", "the outcome code is public on-chain"), "error_detail": "the seller cannot bid"}
     let quantity be int_of(field(p, "quantity", "0"))
     let total be int_of(field(p, "total", "0"))
     when quantity <= 0 or total <= 0
-        give {"error": "quantity and total must be positive"}
+        give {"error": declassify("amount_not_positive", "the outcome code is public on-chain"), "error_detail": "quantity and total must be positive"}
     when quantity > int_of(a["quantity"])
-        give {"error": "the auction offers " + a["quantity"] + ", the bid asks " + text(quantity)}
+        give {"error": declassify("bid_exceeds_offer", "the outcome code is public on-chain"), "error_detail": "the auction offers " + a["quantity"] + ", the bid asks " + text(quantity)}
     let bids be a["bids"]
     let s0 be state
     when contains(bids, bidder)
         set s0 to credit(s0, bidder, a["payment"], int_of(bids[bidder]["total"]))
     when not contains(bids, bidder) and length(keys(bids)) >= MAX_BIDS
-        give {"error": "the book is full (" + text(MAX_BIDS) + " bids)"}
+        give {"error": declassify("book_full", "the outcome code is public on-chain"), "error_detail": "the book is full (" + text(MAX_BIDS) + " bids)"}
     let have be balance_of(s0, bidder, a["payment"])
     when have < total
-        give {"error": "the bidder holds " + text(have) + " of the payment token, the bid needs " + text(total)}
+        give {"error": declassify("insufficient_balance", "the outcome code is public on-chain"), "error_detail": "the bidder holds " + text(have) + " of the payment token, the bid needs " + text(total)}
     let s1 be set_balance(s0, bidder, a["payment"], have - total)
     set a["bid_nonce"] to a["bid_nonce"] + 1
     set bids[bidder] to {"quantity": text(quantity), "total": text(total), "n": a["bid_nonce"]}
     set a["bids"] to bids
     let s2 be bump(save_auction(s1, a))
     let event be {"type": "bid", "auction": a["id"], "quantity": text(quantity), "total": text(total), "escrowed": text(total), "nonce": s2["nonce"]}
-    give {"state": s2, "events": [{"user": bidder, "data": event}], "fuel": "50"}
+    give {"state": s2, "events": [{"user": bidder, "data": event}], "fuel": FUEL}
 
 task cancel_bid(ctx, state, p)
     let a be find_auction(state, p)
     when a == nothing
-        give {"error": "unknown auction " + text(field(p, "auction", ""))}
+        give {"error": declassify("unknown_auction", "the outcome code is public on-chain"), "error_detail": "unknown auction " + text(field(p, "auction", ""))}
     when a["status"] != "open"
-        give {"error": "auction " + a["id"] + " is " + a["status"]}
+        give {"error": declassify("auction_not_open", "the outcome code is public on-chain"), "error_detail": "auction " + a["id"] + " is " + a["status"]}
     let bidder be ctx["sender"]
     when not contains(a["bids"], bidder)
-        give {"error": "no bid of yours in auction " + a["id"]}
+        give {"error": declassify("no_bid", "the outcome code is public on-chain"), "error_detail": "no bid of yours in auction " + a["id"]}
     let total be int_of(a["bids"][bidder]["total"])
     let kept be {}
     each k in keys(a["bids"])
@@ -230,7 +248,7 @@ task cancel_bid(ctx, state, p)
     set a["bids"] to kept
     let s1 be bump(save_auction(credit(state, bidder, a["payment"], total), a))
     let event be {"type": "bid_cancelled", "auction": a["id"], "refunded": text(total), "nonce": s1["nonce"]}
-    give {"state": s1, "events": [{"user": bidder, "data": event}], "fuel": "35"}
+    give {"state": s1, "events": [{"user": bidder, "data": event}], "fuel": FUEL}
 
 -- Better bid first: a higher price (total ÷ quantity, compared by cross-multiplication), then the
 -- earlier one. Insertion sort: the book is small and the order must be the same everywhere.
@@ -242,12 +260,15 @@ task better(x, y)
     give x["n"] < y["n"]
 
 task ranked(bids)
-    let out be []
+    -- Written under private control flow (the payload/state are {app}): born private.
+    let out be private([], "app")
     each bidder in keys(bids)
         let b be bids[bidder]
         set b["bidder"] to bidder
-        let placed be false
-        let next be []
+        -- The ranking compares sealed bids, so both the flag and the list being rebuilt are
+        -- written under private control flow: born private, like `out`.
+        let placed be private(false, "app")
+        let next be private([], "app")
         each item in out
             when not placed and better(b, item)
                 set next to append(next, b)
@@ -267,15 +288,17 @@ task above_reserve(a, b)
 task close(ctx, state, p)
     let a be find_auction(state, p)
     when a == nothing
-        give {"error": "unknown auction " + text(field(p, "auction", ""))}
+        give {"error": declassify("unknown_auction", "the outcome code is public on-chain"), "error_detail": "unknown auction " + text(field(p, "auction", ""))}
     when ctx["sender"] != a["seller"]
-        give {"error": "only the seller closes"}
+        give {"error": declassify("not_seller", "the outcome code is public on-chain"), "error_detail": "only the seller closes"}
     when a["status"] != "open"
-        give {"error": "auction " + a["id"] + " is " + a["status"]}
+        give {"error": declassify("auction_not_open", "the outcome code is public on-chain"), "error_detail": "auction " + a["id"] + " is " + a["status"]}
     let order be ranked(a["bids"])
     let remaining be int_of(a["quantity"])
-    let fills be []
-    let clearing be nothing
+    -- Written under private control flow (the payload/state are {app}): born private.
+    let fills be private([], "app")
+    -- Written under private control flow (the payload/state are {app}): born private.
+    let clearing be private(nothing, "app")
     each b in order
         when remaining > 0 and above_reserve(a, b)
             let filled be min(int_of(b["quantity"]), remaining)
@@ -283,9 +306,12 @@ task close(ctx, state, p)
             set fills to append(fills, {"bidder": b["bidder"], "filled": filled, "bid": b})
             set clearing to b
     let s1 be state
-    let proceeds be 0
-    let events be []
-    let results be []
+    -- Written under private control flow (the payload/state are {app}): born private.
+    let proceeds be private(0, "app")
+    -- Written under private control flow (the payload/state are {app}): born private.
+    let events be private([], "app")
+    -- Written under private control flow (the payload/state are {app}): born private.
+    let results be private([], "app")
     each b in order
         let filled be 0
         let paid be 0
@@ -310,44 +336,50 @@ task close(ctx, state, p)
     let s2 be bump(save_auction(s1, a))
     set events to append(events, {"user": a["seller"], "data": {"type": "cleared", "auction": a["id"], "n": a["n"], "sold": text(sold), "unsold": text(remaining), "proceeds": text(proceeds), "fills": results, "nonce": s2["nonce"]}})
     let kind_code be when a["kind"] == "uniform" then 0 otherwise 1
-    let call be abi_encode("cleared(bytes16,uint256,uint256,uint8)", [int_to_bytes(a["n"], 16), sold, proceeds, kind_code])
-    give {"state": s2, "events": events, "app_events": [{"subtype": "cleared", "data_hex": hex_of(slice(call, 4, length(call)))}], "fuel": "80"}
+    -- The public receipt says that auction <id> closed having sold <sold> of the asset, and how it
+    -- was priced. It does NOT carry `proceeds`: with a single winner — the typical OTC block —
+    -- proceeds IS what that bidder paid, and this app promises the prices stay inside. `close`
+    -- settles nothing on-chain (winners and losers move inside the enclave and take their funds
+    -- out with `withdraw`), so proceeds had no settlement job here either.
+    let call be abi_encode("cleared(bytes16,uint256,uint8)", [int_to_bytes(a["n"], 16), sold, kind_code])
+    give {"state": s2, "events": events, "app_events": [declassify({"subtype": "cleared", "data_hex": hex_of(slice(call, 4, length(call)))}, "public clearing receipt: (auction id, quantity sold, pricing kind) — never a price, never a bidder")], "fuel": FUEL}
 
 -- The seller withdraws the offer: every bid goes back to its bidder, the asset to the seller.
 task cancel(ctx, state, p)
     let a be find_auction(state, p)
     when a == nothing
-        give {"error": "unknown auction " + text(field(p, "auction", ""))}
+        give {"error": declassify("unknown_auction", "the outcome code is public on-chain"), "error_detail": "unknown auction " + text(field(p, "auction", ""))}
     when ctx["sender"] != a["seller"]
-        give {"error": "only the seller cancels"}
+        give {"error": declassify("not_seller", "the outcome code is public on-chain"), "error_detail": "only the seller cancels"}
     when a["status"] != "open"
-        give {"error": "auction " + a["id"] + " is " + a["status"]}
+        give {"error": declassify("auction_not_open", "the outcome code is public on-chain"), "error_detail": "auction " + a["id"] + " is " + a["status"]}
     let s1 be credit(state, a["seller"], a["asset"], int_of(a["quantity"]))
-    let events be []
+    -- Written under private control flow (state/payload are {app}): born private.
+    let events be private([], "app")
     each bidder in keys(a["bids"])
         set s1 to credit(s1, bidder, a["payment"], int_of(a["bids"][bidder]["total"]))
         set events to append(events, {"user": bidder, "data": {"type": "result", "auction": a["id"], "n": a["n"], "filled": "0", "paid": "0", "refunded": a["bids"][bidder]["total"], "cancelled": true}})
     set a["status"] to "cancelled"
     let s2 be bump(save_auction(s1, a))
     set events to append(events, {"user": a["seller"], "data": {"type": "cancelled", "auction": a["id"], "n": a["n"], "nonce": s2["nonce"]}})
-    give {"state": s2, "events": events, "fuel": "50"}
+    give {"state": s2, "events": events, "fuel": FUEL}
 
 task withdraw(ctx, state, p)
     when not is_address(field(p, "token", nothing))
-        give {"error": "withdraw needs a token address"}
+        give {"error": declassify("missing_token", "the outcome code is public on-chain"), "error_detail": "withdraw needs a token address"}
     let token be lower(p["token"])
     let amount be int_of(field(p, "amount", "0"))
     when amount <= 0
-        give {"error": "amounts must be positive"}
+        give {"error": declassify("amount_not_positive", "the outcome code is public on-chain"), "error_detail": "amounts must be positive"}
     let have be balance_of(state, ctx["sender"], token)
     when have < amount
-        give {"error": "insufficient balance: " + text(have) + " < " + text(amount)}
+        give {"error": declassify("insufficient_balance", "the outcome code is public on-chain"), "error_detail": "insufficient balance: " + text(have) + " < " + text(amount)}
     let dest be lower(text(field(p, "to", ctx["sender"])))
     when not is_address(dest)
-        give {"error": "invalid destination address " + dest}
+        give {"error": declassify("invalid_destination", "the outcome code is public on-chain"), "error_detail": "invalid destination address " + dest}
     let s1 be bump(set_balance(state, ctx["sender"], token, have - amount))
     let event be {"type": "withdrawal", "token": token, "to": dest, "amount": text(amount), "balance": text(have - amount), "nonce": s1["nonce"]}
-    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "withdrawals": [{"token": token, "to": dest, "amount": text(amount)}], "fuel": "50"}
+    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "withdrawals": [declassify({"token": token, "to": dest, "amount": text(amount)}, "the pull-payment settles on-chain: payee, token and amount are public by construction")], "fuel": FUEL}
 
 -- Past MAX_CLOSED finished auctions, the oldest go (open ones never do).
 task prune(state)
@@ -375,14 +407,76 @@ task deanonymize(ctx)
     let report_type be text(field(payload, "report_type", "audit"))
     match report_type
         is "audit"
-            give {"report": {"balances": state["balances"], "auctions": state["auctions"]}, "fuel": "20"}
+            give {"report": {"balances": state["balances"], "auctions": state["auctions"]}, "fuel": FUEL}
         is "auction"
             let a be find_auction(state, payload)
             when a == nothing
-                give {"error": "unknown auction " + text(field(payload, "auction", ""))}
-            give {"report": a, "fuel": "20"}
+                give {"error": declassify("unknown_auction", "the outcome code is public on-chain"), "error_detail": "unknown auction " + text(field(payload, "auction", ""))}
+            give {"report": a, "fuel": FUEL}
         otherwise
-            give {"error": "unsupported report type: " + report_type}
+            give {"error": declassify("unknown_report_type", "the outcome code is public on-chain"), "error_detail": "unsupported report type: " + report_type}
+
+-- ---------------------------------------------------------------------------------------
+-- Invariants per transition. The adapter runs this after deploy/deposit/process with
+-- ctx = {kind, before, after, deposit: {token, value, value_hex}?, withdrawals: [{token, to,
+-- amount, amount_hex}], events}. A non-empty list fails the request as `invariant_violation`
+-- (descriptions to the Executor's log, state not applied). Every unit of every token is either
+-- in a balance or in the escrow of an OPEN auction (the asset on offer, each live bid's payment);
+-- open, bid, cancel_bid, close and cancel only move units between the two, deposits add,
+-- withdrawals remove. A matching that pays a bidder twice cannot be signed.
+-- ---------------------------------------------------------------------------------------
+
+task totals_of(state)
+    let totals be private({}, "app")
+    when state == nothing
+        give totals
+    each account in keys(state["balances"])
+        let mine be state["balances"][account]
+        each token in keys(mine)
+            let prev be when contains(totals, token) then totals[token] otherwise 0
+            set totals[token] to prev + int_of(mine[token])
+    each k in keys(state["auctions"])
+        let a be state["auctions"][k]
+        when a["status"] == "open"
+            let held be when contains(totals, a["asset"]) then totals[a["asset"]] otherwise 0
+            set totals[a["asset"]] to held + int_of(a["quantity"])
+            each bidder in keys(a["bids"])
+                let escrowed be when contains(totals, a["payment"]) then totals[a["payment"]] otherwise 0
+                set totals[a["payment"]] to escrowed + int_of(a["bids"][bidder]["total"])
+    give totals
+
+task invariants(ctx)
+    let broken be private([], "app")
+    let after be ctx["after"]
+    each account in keys(after["balances"])
+        each token in keys(after["balances"][account])
+            when starts_with(text(after["balances"][account][token]), "-")
+                set broken to append(broken, "negative balance for " + account + " in " + token)
+    when ctx["kind"] == "deploy" or ctx["kind"] == "load_module"
+        give broken
+    when after["nonce"] != ctx["before"]["nonce"] + 1
+        set broken to append(broken, "nonce did not advance by one")
+    let expected be totals_of(ctx["before"])
+    when contains(ctx, "deposit")
+        let d be ctx["deposit"]
+        let t be lower(d["token"])
+        let prev be when contains(expected, t) then expected[t] otherwise 0
+        set expected[t] to prev + int_of(d["value"])
+    each w in ctx["withdrawals"]
+        let t be lower(w["token"])
+        let prev be when contains(expected, t) then expected[t] otherwise 0
+        set expected[t] to prev - int_of(w["amount"])
+    let actual be totals_of(after)
+    let tokens be keys(expected)
+    each t in keys(actual)
+        when not contains(expected, t)
+            set tokens to append(tokens, t)
+    each t in tokens
+        let want be when contains(expected, t) then expected[t] otherwise 0
+        let have be when contains(actual, t) then actual[t] otherwise 0
+        when have != want
+            set broken to append(broken, "conservation broken for token " + t + ": expected " + text(want) + ", have " + text(have))
+    give broken
 
 -- ---------------------------------------------------------------------------------------
 -- Tests: `synsema test app/app.syn`. The same code runs inside the enclave. Maps are passed by
@@ -397,14 +491,16 @@ let TST be "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 let ID1 be "0x00000000000000000000000000000001"
 
 task dep(state, who, token, amount)
-    give deposit({"app_id": 1, "sender": who, "token": token, "value": amount, "value_hex": "0x0", "state": state})["state"]
+    give deposit({"app_id": 1, "sender": who, "token": token, "value": amount, "value_hex": "0x0", "state": private(state, "app")})["state"]
 
 task send(state, sender, payload)
-    give process({"app_id": 1, "sender": sender, "request_type": 1, "kind": "process", "payload": payload, "payload_hex": nothing, "state": state})
+    give process({"app_id": 1, "sender": sender, "request_type": 1, "kind": "process", "payload": private(payload, "app"), "payload_hex": nothing, "state": private(state, "app")})
 
 -- the seller holds 1000 TST (6 decimals); Ana, Bob and Carl hold 2 ETH each
 task funded()
-    let s be deploy({"app_id": 1, "kind": "deploy", "params": nothing})["state"]
+    -- The states these helpers build carry private balances: born private, like the adapter marks
+    -- them (`"state": private(state, "app")`).
+    let s be private(deploy({"app_id": 1, "kind": "deploy", "params": nothing})["state"], "app")
     set s to dep(s, SELLER, TST, "1000000000")
     set s to dep(s, ANA, ETH, "2000000000000000000")
     set s to dep(s, BOB, ETH, "2000000000000000000")
@@ -445,9 +541,9 @@ test "deposits are per token; opening locks the asset and announces the auction"
     assert_eq(lower(d[1]), TST)
     assert_eq(text(d[2]), "1000000000")
     assert_eq(d[4], 0)
-    assert(starts_with(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "5000000000", "payment": ETH})["error"], "the seller holds"))
-    assert(starts_with(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1", "payment": TST})["error"], "the asset and the payment"))
-    assert(starts_with(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1", "payment": ETH, "kind": "dutch"})["error"], "kind must be"))
+    assert_eq(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "5000000000", "payment": ETH})["error"], "insufficient_asset")
+    assert_eq(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1", "payment": TST})["error"], "same_token")
+    assert_eq(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1", "payment": ETH, "kind": "dutch"})["error"], "unknown_kind")
 
 test "a bid escrows the payment; a new bid replaces the old; the seller cannot bid"
     let s be send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "900000000000000000"})
@@ -457,10 +553,10 @@ test "a bid escrows the payment; a new bid replaces the old; the seller cannot b
     let again be send(s["state"], ANA, {"type": "bid", "auction": ID1, "quantity": "500000000", "total": "800000000000000000"})
     assert_eq(balance_of(again["state"], ANA, ETH), 1200000000000000000)
     assert_eq(again["state"]["auctions"][ID1]["bids"][ANA]["total"], "800000000000000000")
-    assert_eq(send(opened("uniform"), SELLER, {"type": "bid", "auction": ID1, "quantity": "1", "total": "1"})["error"], "the seller cannot bid")
-    assert(starts_with(send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "3000000000000000000"})["error"], "the bidder holds"))
-    assert(starts_with(send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "2000000000", "total": "1"})["error"], "the auction offers"))
-    assert(starts_with(send(opened("uniform"), ANA, {"type": "bid", "auction": "0x00000000000000000000000000000009", "quantity": "1", "total": "1"})["error"], "unknown auction"))
+    assert_eq(send(opened("uniform"), SELLER, {"type": "bid", "auction": ID1, "quantity": "1", "total": "1"})["error"], "seller_cannot_bid")
+    assert_eq(send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "3000000000000000000"})["error"], "insufficient_balance")
+    assert_eq(send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "2000000000", "total": "1"})["error"], "bid_exceeds_offer")
+    assert_eq(send(opened("uniform"), ANA, {"type": "bid", "auction": "0x00000000000000000000000000000009", "quantity": "1", "total": "1"})["error"], "unknown_auction")
     let c be send(s["state"], ANA, {"type": "cancel_bid", "auction": ID1})
     assert_eq(balance_of(c["state"], ANA, ETH), 2000000000000000000)
     assert(not contains(c["state"]["auctions"][ID1]["bids"], ANA))
@@ -481,9 +577,17 @@ test "uniform price: the best bids win, everyone pays the lowest accepted price,
     assert_eq(s["auctions"][ID1]["status"], "closed")
     assert_eq(s["auctions"][ID1]["result"]["sold"], "1000000000")
     assert_eq(s["auctions"][ID1]["result"]["proceeds"], "1000000000000000000")
-    let d be abi_decode("(bytes16,uint256,uint256,uint8)", hex_bytes(r["app_events"][0]["data_hex"]))
+    -- The public receipt is (id, sold, kind): the quantity that changed hands and how it was
+    -- priced. What anyone paid — `proceeds`, which with one winner IS that bidder's price — stays
+    -- inside; the seller reads it from their own encrypted event.
+    let d be abi_decode("(bytes16,uint256,uint8)", hex_bytes(r["app_events"][0]["data_hex"]))
     assert_eq(text(d[1]), "1000000000")
-    assert_eq(text(d[2]), "1000000000000000000")
+    assert_eq(d[2], 0)
+    -- Three static ABI words and no more: (bytes16 id, uint256 sold, uint8 kind). The fourth word
+    -- the receipt used to carry was `proceeds` — with one winner, that bidder's price.
+    assert_eq(length(r["app_events"][0]["data_hex"]), 2 + 192)
+    -- The seller still learns it, in their own encrypted event.
+    assert_eq(r["events"][3]["data"]["proceeds"], "1000000000000000000")
     -- one result per bidder (losing bids stay private: Carl learns only his own), then the seller's summary
     assert_eq(length(r["events"]), 4)
     assert_eq(r["events"][0]["user"], ANA)
@@ -503,13 +607,13 @@ test "an unsold remainder goes back to the seller; ties go to the earlier bid; n
     let s be opened("uniform")
     set s to send(s, ANA, {"type": "bid", "auction": ID1, "quantity": "300000000", "total": "300000000000000000"})["state"]
     set s to send(s, BOB, {"type": "bid", "auction": ID1, "quantity": "300000000", "total": "300000000000000000"})["state"]
-    assert_eq(send(s, ANA, {"type": "close", "auction": ID1})["error"], "only the seller closes")
+    assert_eq(send(s, ANA, {"type": "close", "auction": ID1})["error"], "not_seller")
     let r be send(s, SELLER, {"type": "close", "auction": ID1})
     assert_eq(balance_of(r["state"], SELLER, TST), 400000000)
     assert_eq(balance_of(r["state"], ANA, TST), 300000000)
     assert_eq(balance_of(r["state"], BOB, TST), 300000000)
     assert_eq(r["state"]["auctions"][ID1]["result"]["fills"][0]["bidder"], ANA)
-    assert(starts_with(send(r["state"], SELLER, {"type": "close", "auction": ID1})["error"], "auction " + ID1 + " is closed"))
+    assert_eq(send(r["state"], SELLER, {"type": "close", "auction": ID1})["error"], "auction_not_open")
 
 test "a cancelled auction refunds every bid and returns the asset"
     let r be send(with_bids("uniform"), SELLER, {"type": "cancel", "auction": ID1})
@@ -524,12 +628,92 @@ test "withdrawals are pull-payments from a balance, per token"
     let r be send(s, ANA, {"type": "withdraw", "token": TST, "amount": "600000000"})
     assert_eq(r["withdrawals"], [{"token": TST, "to": ANA, "amount": "600000000"}])
     assert_eq(balance_of(r["state"], ANA, TST), 0)
-    assert(starts_with(send(r["state"], ANA, {"type": "withdraw", "token": TST, "amount": "1"})["error"], "insufficient balance"))
+    assert_eq(send(r["state"], ANA, {"type": "withdraw", "token": TST, "amount": "1"})["error"], "insufficient_balance")
 
 test "the audit sees the whole book; the chain never did"
     let s be send(with_bids("uniform"), SELLER, {"type": "close", "auction": ID1})["state"]
-    let all be deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": {}, "payload_hex": nothing, "state": s})
+    let all be deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": private({}, "app"), "payload_hex": nothing, "state": private(s, "app")})
     assert_eq(length(keys(all["report"]["auctions"][ID1]["bids"])), 3)
-    let one be deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": {"report_type": "auction", "auction": ID1}, "payload_hex": nothing, "state": s})
+    let one be deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": private({"report_type": "auction", "auction": ID1}, "app"), "payload_hex": nothing, "state": private(s, "app")})
     assert_eq(one["report"]["result"]["sold"], "1000000000")
-    assert(starts_with(send(s, SELLER, {"type": "mint"})["error"], "unsupported instruction type"))
+    assert_eq(send(s, SELLER, {"type": "mint"})["error"], "unknown_type")
+
+-- Maps are shared by reference and a successful call mutates the state it was given: snapshot
+-- `before` with a deep copy when a test needs both sides of a transition.
+task copy(v)
+    give json_decode(json_encode(v))
+
+-- The ctx the adapter builds for `invariants` after a call (withdrawals normalized the same way).
+task transition(kind, before, r, deposit)
+    -- Written under private control flow (state/payload are {app}): born private.
+    let ws be private([], "app")
+    when contains(r, "withdrawals")
+        each w in r["withdrawals"]
+            set ws to append(ws, {"token": w["token"], "to": w["to"], "amount": w["amount"], "amount_hex": nothing})
+    let ctx be private({"kind": kind, "before": before, "after": r["state"], "withdrawals": ws, "events": when contains(r, "events") then r["events"] otherwise []}, "app")
+    when deposit != nothing
+        set ctx["deposit"] to deposit
+    give ctx
+
+test "every error is a code; the detail keeps the numbers; the policy passes through deploy"
+    let over be send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "5000000000", "payment": ETH})
+    assert_eq(over["error"], "insufficient_asset")
+    assert_eq(over["error_detail"], "the seller holds 1000000000 of the asset, the auction needs 5000000000")
+    let poor be send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "3000000000000000000"})
+    assert_eq(poor["error"], "insufficient_balance")
+    assert(starts_with(poor["error_detail"], "the bidder holds 2000000000000000000"))
+    assert_eq(send(funded(), SELLER, {"amount": "1"})["error"], "missing_type")
+    let p be deploy({"app_id": 1, "kind": "deploy", "params": {"policy": {"reject": "private", "events_min": 2}}})
+    assert_eq(p["policy"], {"reject": "private", "events_min": 2})
+    assert_eq(p["fuel"], FUEL)
+    assert(not contains(deploy({"app_id": 1, "kind": "deploy", "params": nothing}), "policy"))
+
+test "invariants: open, bid, close, cancel, withdraw and deposit conserve balances plus escrow"
+    let s be funded()
+    let before be copy(s)
+    let o be send(s, SELLER, {"type": "open", "asset": TST, "quantity": "1000000000", "payment": ETH, "reserve": "500000000000000000"})
+    assert_eq(invariants(transition("process", before, o, nothing)), [])
+    let before_bid be copy(o["state"])
+    let b be send(o["state"], ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "900000000000000000"})
+    assert_eq(invariants(transition("process", before_bid, b, nothing)), [])
+    let before_cancel_bid be copy(b["state"])
+    assert_eq(invariants(transition("process", before_cancel_bid, send(b["state"], ANA, {"type": "cancel_bid", "auction": ID1}), nothing)), [])
+    let wb be with_bids("uniform")
+    let before_close be copy(wb)
+    let c be send(wb, SELLER, {"type": "close", "auction": ID1})
+    assert_eq(invariants(transition("process", before_close, c, nothing)), [])
+    let pab be with_bids("pay_as_bid")
+    let before_pab be copy(pab)
+    assert_eq(invariants(transition("process", before_pab, send(pab, SELLER, {"type": "close", "auction": ID1}), nothing)), [])
+    let wb2 be with_bids("uniform")
+    let before_cancel be copy(wb2)
+    assert_eq(invariants(transition("process", before_cancel, send(wb2, SELLER, {"type": "cancel", "auction": ID1}), nothing)), [])
+    let before_withdraw be copy(c["state"])
+    let w be send(c["state"], ANA, {"type": "withdraw", "token": TST, "amount": "600000000"})
+    assert_eq(invariants(transition("process", before_withdraw, w, nothing)), [])
+    let empty be deploy({"app_id": 1, "kind": "deploy", "params": nothing})["state"]
+    let before_dep be copy(empty)
+    let d be deposit({"app_id": 1, "sender": ANA, "token": TST, "value": "5", "value_hex": "0x5", "state": private(empty, "app")})
+    assert_eq(invariants(transition("deposit", before_dep, d, {"token": TST, "value": "5", "value_hex": "0x5"})), [])
+    assert_eq(invariants({"kind": "deploy", "before": nothing, "after": copy(empty), "withdrawals": [], "events": []}), [])
+
+test "invariants refuse a matching that mints, an escrow that leaks and a stuck nonce"
+    let c be send(with_bids("uniform"), SELLER, {"type": "close", "auction": ID1})["state"]
+    -- A bidder credited twice.
+    let minted be credit(copy(c), ANA, TST, 1)
+    set minted["nonce"] to minted["nonce"] + 1
+    let r1 be invariants({"kind": "process", "before": copy(c), "after": minted, "withdrawals": [], "events": []})
+    assert_eq(length(r1), 1)
+    assert(starts_with(r1[0], "conservation broken for token " + TST + ": expected 1000000000, have 1000000001"))
+    -- A bid whose escrow vanished (the book says 0.9 ETH, nobody was debited).
+    let wb be with_bids("uniform")
+    let leaked be copy(wb)
+    set leaked to credit(leaked, ANA, ETH, 900000000000000000)
+    set leaked["nonce"] to leaked["nonce"] + 1
+    let r2 be invariants({"kind": "process", "before": copy(wb), "after": leaked, "withdrawals": [], "events": []})
+    assert_eq(length(r2), 1)
+    assert(starts_with(r2[0], "conservation broken for token " + ETH))
+    -- Nothing moved, the nonce neither: a deposit that was not credited.
+    let r3 be invariants({"kind": "deposit", "before": copy(c), "after": copy(c), "deposit": {"token": TST, "value": "5", "value_hex": "0x5"}, "withdrawals": [], "events": []})
+    assert(contains(r3, "nonce did not advance by one"))
+    assert_eq(length(r3), 2)

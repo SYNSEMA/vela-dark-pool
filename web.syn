@@ -396,10 +396,11 @@ task overview(s, ok, err)
                     let x be abi_decode("(bytes16,address,uint256,address,uint8)", data)
                     set d["chain"] to append(d["chain"], {"block": item["block"], "line": "opened · #" + text(bytes_to_int(x[0])) + " · " + human(c, lower(x[1]), x[2]) + " for " + symbol_of(c, lower(x[3])) + " · " + (when x[4] == 0 then "uniform" otherwise "pay as bid")})
                 when item["label"] == "cleared"
-                    let x be abi_decode("(bytes16,uint256,uint256,uint8)", data)
+                    -- (bytes16 id, uint256 sold, uint8 kind): no proceeds on-chain any more.
+                    let x be abi_decode("(bytes16,uint256,uint8)", data)
                     let a be find_auction(s, text(bytes_to_int(x[0])))
                     when a != nothing
-                        set d["chain"] to append(d["chain"], {"block": item["block"], "line": "cleared · #" + a["n"] + " · sold " + human(c, a["asset"], x[1]) + " · proceeds " + human(c, a["payment"], x[2])})
+                        set d["chain"] to append(d["chain"], {"block": item["block"], "line": "cleared · #" + a["n"] + " · sold " + human(c, a["asset"], x[1]) + " · " + (when x[2] == 0 then "uniform" otherwise "pay as bid")})
         recover e
             set d["note"] to "could not read the enclave's events: " + text(e)
         set d["auctions"] to auction_rows(c, s, cleared)

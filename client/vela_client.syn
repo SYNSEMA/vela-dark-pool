@@ -267,7 +267,7 @@ task run_cli(a)
             usage()
 
 -- The public events, decoded: `opened` (id, asset, quantity, payment, kind) and `cleared`
--- (id, sold, proceeds, kind) — what anyone can read from the chain.
+-- (id, sold, kind) — what anyone can read from the chain. No price is in either of them.
 task decode_public(c, item)
     let out be {"request_id": item["request_id"], "block": item["block"], "label": item["label"]}
     try
@@ -276,8 +276,11 @@ task decode_public(c, item)
             let d be abi_decode("(bytes16,address,uint256,address,uint8)", data)
             set out["auction"] to {"id": v.hex_of(d[0]), "n": bytes_to_int(d[0]), "asset": lower(d[1]), "quantity": text(d[2]), "payment": lower(d[3]), "kind": when d[4] == 0 then "uniform" otherwise "pay_as_bid"}
         when item["label"] == "cleared"
-            let d be abi_decode("(bytes16,uint256,uint256,uint8)", data)
-            set out["result"] to {"id": v.hex_of(d[0]), "n": bytes_to_int(d[0]), "sold": text(d[1]), "proceeds": text(d[2]), "kind": when d[3] == 0 then "uniform" otherwise "pay_as_bid"}
+            -- (bytes16 id, uint256 sold, uint8 kind). The receipt no longer carries `proceeds`:
+            -- with a single winner that IS what the winner paid, and prices stay in the enclave.
+            -- The seller reads the proceeds from their own encrypted `cleared` event.
+            let d be abi_decode("(bytes16,uint256,uint8)", data)
+            set out["result"] to {"id": v.hex_of(d[0]), "n": bytes_to_int(d[0]), "sold": text(d[1]), "kind": when d[2] == 0 then "uniform" otherwise "pay_as_bid"}
     recover err
         set out["error"] to text(err)
     give out

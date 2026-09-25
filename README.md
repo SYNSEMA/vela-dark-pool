@@ -11,7 +11,7 @@ or pay-as-bid), which is what the code calls it: `open`, `bid`, `close`.
 ```
 seller ───open (asset, quantity, payment, reserve, kind)──▶ ┌────────── enclave ──────────┐──▶ chain: opened(id, asset, quantity, payment, kind)
 bidder ───bid (quantity, total), sealed────────────────────▶ │ escrow · the book · ranking   │
-seller ───close───────────────────────────────────────────▶ │ matching · settlement        │──▶ chain: cleared(id, sold, proceeds, kind)
+seller ───close───────────────────────────────────────────▶ │ matching · settlement        │──▶ chain: cleared(id, sold, kind)
                                                              └──────────────────────────────┘──▶ each bidder: its own result (fill, price paid)
 anyone ───withdraw (a pull-payment) · claim-for on-chain                                       ──▶ the seller: the fills
 auditor ──audit ──▶ the whole book
@@ -128,11 +128,27 @@ facilitator flow). An auction is named by its number (`1`) or its id (`0x…01`)
 
 ## What stays private, what the chain sees
 
-Private: every bid (quantity, total, who), the ranking, who lost, what the winners paid
-individually, the balances. Each bidder learns only its own result and the clearing price; the
-seller learns the fills; an allowed authority can read the whole book. Public: that an auction
-opened (asset, quantity, payment token, kind), that it cleared (quantity sold, proceeds, kind),
-deposits and withdrawals as token movements, request fees.
+Private: every bid's **price** (the total it offered), the ranking, who bid, who lost, what each
+winner paid, the total the auction raised, the balances. Each bidder learns only its own result
+and the clearing price; the seller learns the fills; an allowed authority can read the whole book.
+Public: that an auction opened (asset, quantity offered, payment token, pricing kind), that it
+cleared (auction id, **quantity sold**, pricing kind), deposits and withdrawals as token movements,
+who submitted each request and when, and the fee — one value for every request this app serves,
+so it does not say which instruction ran.
+
+The quantity sold is published on purpose: it is the headline of a block trade and the one number
+that makes the venue auditable — without it nobody can tell an auction that traded from one that
+did not. Know what that costs: **when a single bidder takes the whole lot, the quantity sold is
+that bidder's quantity**, so their size (never their price) is public, and a partial clear tells
+you the winning side's total size. If your trade cannot afford that, split the lot across auctions
+or use a venue that settles off this receipt. The price never leaves either way — that is why
+`proceeds` was taken off this receipt: with one winner it *was* the winner's price, and `close`
+settles nothing on-chain, so it bought nothing.
+
+The clearing receipt used to carry `proceeds` too. It does not any more: with a single winner —
+the typical OTC block — proceeds *is* that bidder's price, and this app promises prices stay
+inside. Nothing on-chain settles from it (winners and losers move inside the enclave and take
+their funds out with `withdraw`), so it had no job there.
 
 ## Gotchas
 
