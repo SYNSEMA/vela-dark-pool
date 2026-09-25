@@ -11,7 +11,7 @@ export task u32_le(n)
     give bytes([n % 256, floor(n / 256) % 256, floor(n / 65536) % 256, floor(n / 16777216) % 256])
 
 export task base_name(path)
-    let parts be split(replace_text(path, "\\", "/"), "/")
+    let parts be split(replace(path, "\\", "/"), "/")
     give parts[length(parts) - 1]
 
 export task slot_offset(wasm)

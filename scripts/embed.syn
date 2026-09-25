@@ -24,11 +24,15 @@ otherwise
 -- Tests (pure): `synsema test embed.syn`
 -- ---------------------------------------------------------------------------------------
 
+-- The WASM magic and version (00 61 73 6d 01 00 00 00), written as bytes: before v0.6.29 a
+-- string escape u0000 was six literal characters, from v0.6.29 it is the byte itself.
+let WASM_HEADER be bytes([0, 97, 115, 109, 1, 0, 0, 0])
+
 task fake_module(program)
     let n be bytes("app.syn")
     let header be bytes("SYNSEMA.APPSLOT1") + bytes([length(n)]) + n + slot.fill(63 - length(n)) + slot.u32_le(length(bytes(program)))
     let padding be slot.fill(524288 - 84 - length(bytes(program)))
-    give bytes("\u0000asm\u0001\u0000\u0000\u0000 before ") + header + bytes(program) + padding + bytes(" after")
+    give WASM_HEADER + bytes(" before ") + header + bytes(program) + padding + bytes(" after")
 
 test "u32 little-endian"
     assert_eq(slot.u32_le(258), bytes([2, 1, 0, 0]))

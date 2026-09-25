@@ -70,7 +70,7 @@ task token_of(t)
 task decimals_of(c, token)
     when token == ETH
         give 18
-    give abi_decode("uint8", eth_call(c["rpc"], {"to": token, "data": abi_encode("decimals()", [])}))[0]
+    give abi_decode("uint8", evm_call(c["rpc"], {"to": token, "data": abi_encode("decimals()", [])}))[0]
 
 task units(c, token, tokens)
     give v.to_units(tokens, decimals_of(c, token))
@@ -198,7 +198,7 @@ task run_cli(a)
         is "user-keys"
             let k be decode(random_bytes(32), "hex")
             print("VELA_USER_KEY=" + k)
-            print("address " + eth_address(as_secret(k, "VELA_USER_KEY")))
+            print("address " + evm_address(as_secret(k, "VELA_USER_KEY")))
         is "deploy"
             let params be when length(a) > 2 and a[2] != "-" then json_decode(a[2]) otherwise nothing
             let trigger be arg_or(a, 3, nothing)

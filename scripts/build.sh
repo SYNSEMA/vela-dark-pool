@@ -8,11 +8,11 @@
 #
 #   sh scripts/build.sh                          # app/app.syn with the guest of SYNSEMA_TAG (downloaded once into .synsema/)
 #   APP=path/to/other.syn sh scripts/build.sh
-#   SYNSEMA_TAG=v0.6.23 sh scripts/build.sh      # pin the guest's release (default below)
+#   SYNSEMA_TAG=v0.6.29 sh scripts/build.sh      # pin the guest's release (default below)
 #   GUEST_WASM=/path/to/synsema-vela-guest.wasm sh scripts/build.sh   # a guest you built or downloaded yourself
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SYNSEMA_TAG="${SYNSEMA_TAG:-v0.6.23}"
+SYNSEMA_TAG="${SYNSEMA_TAG:-v0.6.29}"
 APP="${APP:-$ROOT/app/app.syn}"
 GUEST_WASM="${GUEST_WASM:-$ROOT/.synsema/synsema-vela-guest-$SYNSEMA_TAG.wasm}"
 

@@ -38,7 +38,9 @@ use "./scripts/embed_lib.syn" as slot
 let ETH be "0x0000000000000000000000000000000000000000"
 let PROCESS be 1
 let ASSOCIATE_KEY be 3
-let GUEST_TAG be env("SYNSEMA_GUEST_TAG", "v0.6.23")
+let GUEST_TAG be env("SYNSEMA_GUEST_TAG", "v0.6.29")
+-- The guest cached per release: bumping GUEST_TAG downloads the new one instead of reusing the old.
+let GUEST_CACHE be "data/guest-" + GUEST_TAG + ".wasm"
 let STATE be "data/auction.json"
 
 -- ---- state on the volume ----
@@ -59,15 +61,23 @@ task config(s)
 
 -- ---- keys ----
 
+-- The state with this console's P-521 key, created (and saved) the first time. Maps are values:
+-- a task that goes on to change `s` and save it must take this one back (`set s to with_p521(s)`),
+-- or its save would write the state without the key and the next request would make another.
+task with_p521(s)
+    when env("VELA_P521_KEY", "") != "" or s["p521_key"] != ""
+        give s
+    let kp be ecdh_keypair("P-521")
+    set s["p521_key"] to decode(reveal(kp["private"]), "hex")
+    set s["p521_pub"] to decode(kp["public"], "hex")
+    save(s)
+    give s
+
 task p521_pair(s)
     when env("VELA_P521_KEY", "") != ""
         give {"key": v.p521_key(), "pub": v.p521_public()}
-    when s["p521_key"] == ""
-        let kp be ecdh_keypair("P-521")
-        set s["p521_key"] to decode(reveal(kp["private"]), "hex")
-        set s["p521_pub"] to decode(kp["public"], "hex")
-        save(s)
-    give {"key": v.p521_of(s["p521_key"]), "pub": v.hex_bytes(s["p521_pub"])}
+    let k be with_p521(s)
+    give {"key": v.p521_of(k["p521_key"]), "pub": v.hex_bytes(k["p521_pub"])}
 
 task seller()
     give v.secp_key()
@@ -80,13 +90,13 @@ task bidder_key(b)
 task decimals_of(c, token)
     when token == ETH
         give 18
-    give abi_decode("uint8", eth_call(c["rpc"], {"to": token, "data": abi_encode("decimals()", [])}))[0]
+    give abi_decode("uint8", evm_call(c["rpc"], {"to": token, "data": abi_encode("decimals()", [])}))[0]
 
 task symbol_of(c, token)
     when token == ETH
         give "ETH"
     try
-        give abi_decode("string", eth_call(c["rpc"], {"to": token, "data": abi_encode("symbol()", [])}))[0]
+        give abi_decode("string", evm_call(c["rpc"], {"to": token, "data": abi_encode("symbol()", [])}))[0]
     recover e
         give "tokens"
 
@@ -113,7 +123,7 @@ task nice(t)
     give group(parts[0]) + (when dec == "" then "" otherwise "." + dec)
 
 task host_of(url)
-    let u be replace_text(replace_text(text(url), "https://", ""), "http://", "")
+    let u be replace(replace(text(url), "https://", ""), "http://", "")
     give split(u, "/")[0]
 
 task human(c, token, u)
@@ -140,12 +150,12 @@ task encrypted(c, keys, plain)
     give v.seal(v.derive_key(keys["key"], v.tee_public_key(c)), bytes(json_encode(plain)))
 
 task qs(msg)
-    let m be replace_text(text(msg), "%", "%25")
-    set m to replace_text(m, "&", "%26")
-    set m to replace_text(m, "#", "%23")
-    set m to replace_text(m, "+", "%2B")
-    set m to replace_text(m, "?", "%3F")
-    give replace_text(trim(m), " ", "+")
+    let m be replace(text(msg), "%", "%25")
+    set m to replace(m, "&", "%26")
+    set m to replace(m, "#", "%23")
+    set m to replace(m, "+", "%2B")
+    set m to replace(m, "?", "%3F")
+    give replace(trim(m), " ", "+")
 
 task back(path, ok, err)
     when err != ""
@@ -231,7 +241,7 @@ task lines_of(c, s, keys, secp, limit)
 task wallet(c, token, holder)
     try
         when token == ETH
-            give nice(v.from_units(text(eth_balance(c["rpc"], holder)), 18)) + " ETH"
+            give nice(v.from_units(text(evm_balance(c["rpc"], holder)), 18)) + " ETH"
         give human(c, token, v.token_balance_of(c, token, holder))
     recover e
         give "?"
@@ -246,13 +256,14 @@ task claimable(c, token, holder)
 
 task do_deploy(s)
     let c be config(s)
+    set s to with_p521(s)
     let keys be p521_pair(s)
     let guest be nothing
-    when file_exists("data/guest.wasm")
-        set guest to read_file_bytes("data/guest.wasm")
+    when file_exists(GUEST_CACHE)
+        set guest to read_file_bytes(GUEST_CACHE)
     otherwise
         set guest to slot.release_guest(GUEST_TAG)
-        write_file("data/guest.wasm", guest)
+        write_file(GUEST_CACHE, guest)
     let wasm be slot.embed(guest, read_file("app/app.syn"), "app.syn")
     let ids be v.deploy_bytes(c, wasm, {}, nothing)
     v.wait_completed(c, ids["request_id"], true)
@@ -277,10 +288,11 @@ task do_fund(s, amount)
 -- funded by itself — two requests
 task do_bidder(s, name, eth, deposit)
     let c be config(s)
+    set s to with_p521(s)
     let keys be p521_pair(s)
     let key be decode(random_bytes(32), "hex")
     let secret be v.secp_of(key, "VELA_USER_KEY")
-    let address be eth_address(secret)
+    let address be evm_address(secret)
     v.send_tx(c, address, v.int_of(units(c, ETH, eth)), bytes(""))
     let id be v.submit_as(c, secret, ASSOCIATE_KEY, v.register_payload_with(c, keys["key"], keys["pub"], secret), ETH, 0)
     v.wait_completed(c, id, false)
@@ -292,6 +304,7 @@ task do_bidder(s, name, eth, deposit)
 
 task do_open(s, f)
     let c be config(s)
+    set s to with_p521(s)
     let keys be p521_pair(s)
     let asset be v.app_token(c)
     let plain be {"type": "open", "asset": asset, "quantity": units(c, asset, text(field(f, "quantity", "0"))), "payment": ETH, "reserve": units(c, ETH, text(field(f, "reserve", "0"))), "kind": text(field(f, "kind", "uniform"))}

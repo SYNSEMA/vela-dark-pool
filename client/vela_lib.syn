@@ -80,11 +80,11 @@ export task p521_public()
     give b
 
 export task me()
-    give eth_address(secp_key())
+    give evm_address(secp_key())
 
 -- The Executor's communication key, published on-chain by the TEE authenticator.
 export task tee_public_key(c)
-    let raw be eth_call(c["rpc"], {"to": need(c, "tee_auth", "VELA_TEE_AUTHENTICATOR"), "data": abi_encode("getPubSecp521r1()", [])})
+    let raw be evm_call(c["rpc"], {"to": need(c, "tee_auth", "VELA_TEE_AUTHENTICATOR"), "data": abi_encode("getPubSecp521r1()", [])})
     let pub be abi_decode("bytes", raw)[0]
     when length(pub) != 133
         raise("the TEE authenticator returned " + text(length(pub)) + " bytes, not a 133-byte P-521 key")
@@ -113,7 +113,7 @@ export task seed_of(secp)
 export task subtypes(seed)
     let out be []
     each i in range(1, 51)
-        set out to append(out, "0x" + hmac_sha256(as_secret(bytes([i]), "subtype-index"), as_secret(seed, "subtype-seed")))
+        set out to append(out, hex(hmac(as_secret(bytes([i]), "subtype-index"), as_secret(seed, "subtype-seed"))))
     give out
 
 -- ---- transactions ----
@@ -125,12 +125,12 @@ export task send_tx(c, dest, value, calldata)
 -- (a demo bidder, a person a portal holds keys for) acting for itself, fees and all
 export task send_tx_as(c, key, dest, value, calldata)
     let url be c["rpc"]
-    let sender be eth_address(key)
-    let gas be eth_estimate_gas(url, {"from": sender, "to": dest, "value": value, "data": calldata})
-    let fees be eth_fee_history(url)
-    let tx be tx_eip1559({
-        "chain_id": eth_chain_id(url),
-        "nonce": eth_nonce(url, sender),
+    let sender be evm_address(key)
+    let gas be evm_estimate_gas(url, {"from": sender, "to": dest, "value": value, "data": calldata})
+    let fees be evm_fee_history(url)
+    let tx be evm_tx({
+        "chain_id": evm_chain_id(url),
+        "nonce": evm_nonce(url, sender),
         "to": dest,
         "value": value,
         "gas": gas + floor(gas / 4),
@@ -139,8 +139,8 @@ export task send_tx_as(c, key, dest, value, calldata)
         "data": calldata
     })
     let sig be secp256k1_sign(tx["digest"], key)
-    let hash be eth_send_raw(url, tx_eip1559_raw(tx, sig))
-    let receipt be eth_wait_receipt(url, hash, 1, 120)
+    let hash be evm_send(url, evm_tx_raw(tx, sig))
+    let receipt be evm_wait(url, hash, 1, 120)
     when receipt == nothing
         raise("transaction " + hash + " was not mined within 120 s")
     when receipt["status"] != 1
@@ -317,12 +317,13 @@ export task user_key()
     give secret("VELA_USER_KEY")
 
 export task user_address()
-    give eth_address(user_key())
+    give evm_address(user_key())
 
--- OpenZeppelin's ECDSA.recover wants v = 27/28; secp256k1_sign gives the recovery id 0/1.
-export task eth_signature(digest, key)
-    let sig be secp256k1_sign(digest, key)
-    give slice(sig, 0, 64) + bytes([sig[64] + 27])
+-- OpenZeppelin's ECDSA.recover wants v = 27/28; secp256k1_sign gives the recovery id 0/1 and
+-- evm_signature rewrites it. Named sign_eth so it does not shadow the evm_signature builtin's
+-- deprecated alias eth_signature.
+export task sign_eth(digest, key)
+    give evm_signature(secp256k1_sign(digest, key))
 
 export task authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline)
     let domain be {"name": "Vela", "version": "0", "chainId": chain_id, "verifyingContract": processor}
@@ -349,29 +350,29 @@ export task permit_bytes(signature65)
     give int_to_bytes(signature65[64], 32) + slice(signature65, 0, 64)
 
 export task call_uint(c, dest, signature, args)
-    give abi_decode("uint256", eth_call(c["rpc"], {"to": dest, "data": abi_encode(signature, args)}))[0]
+    give abi_decode("uint256", evm_call(c["rpc"], {"to": dest, "data": abi_encode(signature, args)}))[0]
 
 export task submit_for(c, request_type, payload, token, asset_amount)
     give submit_for_with(c, user_key(), request_type, payload, token, asset_amount)
 
 -- the same, for the user whose key is given (a secret of hex)
 export task submit_for_with(c, ukey, request_type, payload, token, asset_amount)
-    let user be eth_address(ukey)
+    let user be evm_address(ukey)
     let processor be need(c, "processor", "VELA_PROCESSOR")
     let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
-    let chain_id be eth_chain_id(c["rpc"])
+    let chain_id be evm_chain_id(c["rpc"])
     let deadline be floor(now()) + 3600
     -- facilitatorNonces(address) is the public mapping's getter: it exists in v0.2.0 and in v0.3.0,
     -- where getFacilitatorNonce(address) is removed (Vela CHANGELOG, breaking changes).
     let nonce be call_uint(c, processor, "facilitatorNonces(address)", [user])
-    let authorization be eth_signature(authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline), ukey)
+    let authorization be sign_eth(authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline), ukey)
     let permit be bytes([])
     when asset_amount > 0
         when token == ETH
             raise("a facilitator deposit must be an ERC-20 (permit); ETH cannot be deposited through submitRequestFor")
-        let token_name be abi_decode("string", eth_call(c["rpc"], {"to": token, "data": abi_encode("name()", [])}))[0]
+        let token_name be abi_decode("string", evm_call(c["rpc"], {"to": token, "data": abi_encode("name()", [])}))[0]
         let token_nonce be call_uint(c, token, "nonces(address)", [user])
-        set permit to permit_bytes(eth_signature(permit_digest(chain_id, token, token_name, user, processor, asset_amount, token_nonce, deadline), ukey))
+        set permit to permit_bytes(sign_eth(permit_digest(chain_id, token, token_name, user, processor, asset_amount, token_nonce, deadline), ukey))
     let calldata be abi_encode("submitRequestFor(address,uint8,uint64,uint8,bytes,address,uint256,uint256,bytes,bytes)", [user, PROTOCOL_VERSION, app_id, request_type, payload, token, asset_amount, deadline, authorization, permit])
     let receipt be send_tx(c, processor, int_of(c["max_fee"]), calldata)
     give request_id_of(receipt)
@@ -392,7 +393,7 @@ export task download_report(c, report_id)
     when length(id_hex) != 64
         raise("a report id is 32 bytes of hex (optionally prefixed by <appId>_), got " + report_id)
     let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
-    let chain_id be eth_chain_id(c["rpc"])
+    let chain_id be evm_chain_id(c["rpc"])
     let n be http_get(c["authority"] + "/nonce")["json"]
     let msg be int_to_bytes(chain_id, 8) + int_to_bytes(app_id, 8) + bytes(id_hex, "hex") + bytes(n["nonce"], "hex")
     let prefix be bytes([25]) + bytes("Ethereum Signed Message:\n" + text(length(msg)))
@@ -443,7 +444,7 @@ export task app_token(c)
     give need(c, "token", "VELA_TOKEN")
 
 export task token_decimals(c)
-    give abi_decode("uint8", eth_call(c["rpc"], {"to": app_token(c), "data": abi_encode("decimals()", [])}))[0]
+    give abi_decode("uint8", evm_call(c["rpc"], {"to": app_token(c), "data": abi_encode("decimals()", [])}))[0]
 
 -- "1500.50" with 6 decimals → "1500500000": exact, by text, never a float.
 export task to_units(amount, decimals)
@@ -482,7 +483,7 @@ export task pending_claim(c, payee)
 -- The balance of any ERC-20 (or ETH) an address holds on-chain.
 export task token_balance_of(c, token, holder)
     when token == ETH
-        give eth_balance(c["rpc"], holder)
+        give evm_balance(c["rpc"], holder)
     give call_uint(c, token, "balanceOf(address)", [holder])
 
 -- floor(a / b) for integers of any size: `/` goes through a float, this does not.
