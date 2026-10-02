@@ -6,7 +6,7 @@
 
 name = "Dark pool"
 slug = "vela-dark-pool"
-version = "0.3.0"
+version = "0.3.1"
 kind = "web"
 entry = "web.syn"
 engine = "0.6"
