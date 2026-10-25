@@ -1,20 +1,26 @@
 -- Sealed-bid auction on Vela: a seller offers a block of one token for another (an OTC block, a
 -- token sale, a treasury bill); bidders deposit the payment token and send their bids ENCRYPTED to
 -- the enclave; nobody — not the other bidders, not the seller — sees a bid before the close; the
--- matching runs inside, deterministically; winners and losers are settled from their escrow, and
--- the losing bids are never revealed to anyone. The chain sees that an auction opened and what it
--- cleared at, never who bid what. This file is the WHOLE application: it is embedded into the
--- guest module (`scripts/build.sh` → build/app.wasm), so the SHA-256 Vela verifies covers it.
+-- matching runs inside, deterministically; winners and losers are settled from their escrow. At
+-- the close each winner learns its own fill, each loser only its refund, the seller the winners;
+-- the losing bids are then dropped and never reach anyone, an auditor included. What the chain
+-- still shows (who sends each request and when, the seller of each auction, deposits and
+-- withdrawals) is in README.md, "What an observer can work out". This file is the WHOLE
+-- application: it is embedded into the guest module (`scripts/build.sh` → build/app.wasm), so the
+-- SHA-256 Vela verifies covers it.
 --
 -- Entry points (one map in, one map out; see https://synsema.dev/en/0.6.x/73-vela):
---   deploy(ctx)       no params
+--   deploy(ctx)       no params needed: the private output policy is the default (POLICY below)
 --   deposit(ctx)      ETH or any allowlisted ERC-20; credits the sender's balance in that token
 --   process(ctx)      {"type": "open", "asset", "quantity", "payment", "reserve"?, "kind"?: "uniform" | "pay_as_bid"}   the seller
 --                     {"type": "bid", "auction", "quantity", "total"}          a bidder: `quantity` of the asset for `total` of the payment token
 --                     {"type": "cancel_bid", "auction"}                         a bidder, before the close
 --                     {"type": "close", "auction"} · {"type": "cancel", "auction"}   the seller
 --                     {"type": "withdraw", "token", "amount", "to"?}            anyone, from their balance (a pull-payment)
---   deanonymize(ctx)  {"report_type"?: "audit" | "auction", "auction"?}       an allowed authority: the whole book
+--                     unknown keys are ignored: clients pad payloads to a fixed size with "_"
+--   deanonymize(ctx)  {"report_type"?: "audit" | "auction", "auction"?}       an allowed authority: the balances and
+--                     the finished auctions' results (winners and what they paid); never an open book
+--   trusted(ctx)      refused: this app has no trigger contract
 --
 -- Amounts are the token's smallest unit as decimal TEXT. A price is never a float: a bid is a
 -- (quantity, total) pair, bids are ranked by cross-multiplication, and a partial fill pays
@@ -24,11 +30,30 @@
 -- closes. Test natively before building: `synsema test app/app.syn`.
 intent: "vela app: sealed-bid auction — encrypted bids, matching inside the enclave, settlement from escrow"
 
+-- What leaves the enclave in clear, each at its own `declassify` with the reason: the refusal codes,
+-- the opening and clearing receipts, the withdrawals.
+require declassify("app")
+
 let ETH be "0x0000000000000000000000000000000000000000"
 let MAX_BIDS be 200
-let MAX_CLOSED be 100
+-- The state is one document Vela passes to every call, capped at 10 MiB (Vela 0.2.1): nothing in
+-- it may grow without a bound. Open books are capped (per seller, so one seller cannot take every
+-- slot, and in total), a finished auction keeps only its winners, the history is pruned on every
+-- open, close and cancel, and an emptied balance leaves no row. Worst case: 20 books of 200 bids
+-- (437 KB, measured on Vela's runtime by tests/vela) plus 50 finished auctions of up to 200 winners
+-- (~1.1 MB, estimated).
+let MAX_OPEN be 20
+let MAX_OPEN_PER_SELLER be 3
+let MAX_CLOSED be 50
+-- 2^256 - 1: every amount must fit a uint256, or the receipts and withdrawals could not encode it.
+let MAX_UINT be "115792089237316195423570985008687907853269984665640564039457584007913129639935"
 -- One fuel for every entry point: a per-branch value (5/35/50/80) would name the instruction on-chain.
 let FUEL be "80"
+-- The output policy, kept by the adapter inside the signed state (`_vela`): a refused request is an
+-- ordinary success with the reason encrypted to its sender; every event is padded to 256 bytes;
+-- every result has at least 2 events; the state is padded too (on by default under `reject`); the
+-- fee is FUEL, declared, so no literal elsewhere in this file can change it.
+let POLICY be {"reject": "private", "events_pad": 256, "events_min": 2, "fuel": FUEL}
 
 task hex_of(b)
     give "0x" + decode(b, "hex")
@@ -77,6 +102,24 @@ task div_floor(a, b)
 task min(a, b)
     give when a < b then a otherwise b
 
+-- An amount from a payload: decimal digits that fit a uint256, as an integer; `nothing` for
+-- anything else ("1.5", "-1", "", "0x10", a number, a map). A malformed amount is the app's refusal
+-- (`bad_amount`, private under POLICY), never a runtime error, which would fail publicly.
+task amount_in(p, key, default)
+    let v be field(p, key, default)
+    when type_of(v) != "text"
+        give nothing
+    let s be trim(v)
+    when s == "" or length(s) > 78 or not matches(s, "^[0-9]+$")
+        give nothing
+    let n be int_of(s)
+    when n > int_of(MAX_UINT)
+        give nothing
+    give n
+
+task bad_amount(key)
+    give {"error": declassify("bad_amount", "the outcome code is public on-chain"), "error_detail": key + " must be a whole number of the token's smallest unit, as decimal text"}
+
 -- ---- state ----
 
 task new_state(app_id)
@@ -87,13 +130,22 @@ task balance_of(state, account, token)
         give int_of(state["balances"][account][token])
     give 0
 
+-- A zero balance is no row at all: a 1-wei deposit withdrawn leaves nothing behind (DARKPOOL-01).
 task set_balance(state, account, token, amount)
     let balances be state["balances"]
     -- A brand-new row is born private: it is about to hold a balance, and a public container
     -- cannot take a private write (the position itself would leak).
     let mine be when contains(balances, account) then balances[account] otherwise private({}, "app")
-    set mine[token] to text(amount)
-    set balances[account] to mine
+    when amount == 0
+        when contains(mine, token)
+            set mine to remove(mine, token)
+    otherwise
+        set mine[token] to text(amount)
+    when length(keys(mine)) == 0
+        when contains(balances, account)
+            set balances to remove(balances, account)
+    otherwise
+        set balances[account] to mine
     set state["balances"] to balances
     give state
 
@@ -116,22 +168,42 @@ task save_auction(state, a)
     set state["auctions"] to auctions
     give state
 
+-- Open auctions in total, and of one seller. Counted under private control flow: born private.
+task count_open(state, seller)
+    let all be private(0, "app")
+    let mine be private(0, "app")
+    each k in keys(state["auctions"])
+        let a be state["auctions"][k]
+        when a["status"] == "open"
+            set all to all + 1
+            when a["seller"] == seller
+                set mine to mine + 1
+    give {"all": all, "mine": mine}
+
 task public_auction(a)
     give {"id": a["id"], "n": a["n"], "asset": a["asset"], "quantity": a["quantity"], "payment": a["payment"], "reserve": a["reserve"], "kind": a["kind"], "status": a["status"]}
 
 -- ---- entry points ----
 
--- No params, except an optional {"policy": {"reject": "private", "events_pad": 256, "events_min": 2}}:
--- the output policy the adapter keeps inside the state (`_vela`). A rejected bid then looks like
--- any other request on-chain and the bidder gets the reason encrypted.
+-- No params: the private policy (POLICY) is the default, so a deploy with no constructor
+-- parameters is already private (DARKPOOL-02). {"policy": {…}} replaces it whole — for a test
+-- that wants to see refusals as public failures, never for a real deployment.
+task policy_of(ctx)
+    let params be ctx["params"]
+    when type_of(params) == "map" and contains(params, "policy") and params["policy"] != nothing
+        give params["policy"]
+    give POLICY
+
 task deploy(ctx)
-    let r be {"state": new_state(ctx["app_id"]), "fuel": FUEL}
-    when ctx["params"] != nothing and contains(ctx["params"], "policy") and ctx["params"]["policy"] != nothing
-        set r["policy"] to ctx["params"]["policy"]
-    give r
+    give {"state": new_state(ctx["app_id"]), "policy": policy_of(ctx), "fuel": FUEL}
 
 task load_module(ctx)
-    give {"state": new_state(ctx["app_id"]), "fuel": FUEL}
+    give {"state": new_state(ctx["app_id"]), "policy": POLICY, "fuel": FUEL}
+
+-- TRUSTPROCESS comes from a trigger contract; this app has none, so it refuses them by name
+-- instead of running them as an instruction without a sender (DARKPOOL-06).
+task trusted(ctx)
+    give {"error": declassify("no_trigger", "the outcome code is public on-chain"), "error_detail": "this app has no trigger contract"}
 
 task deposit(ctx)
     let token be lower(ctx["token"])
@@ -141,8 +213,12 @@ task deposit(ctx)
     give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "fuel": FUEL}
 
 task process(ctx)
+    -- Only PROCESS (1) runs an instruction: the Executor routes the other types elsewhere, and
+    -- anything else reaching here is refused rather than guessed at (DARKPOOL-06).
+    when ctx["request_type"] != 1
+        give {"error": declassify("unsupported_request", "the outcome code is public on-chain"), "error_detail": "request type " + text(ctx["request_type"]) + " is not an instruction"}
     let payload be ctx["payload"]
-    when payload == nothing or not contains(payload, "type")
+    when type_of(payload) != "map" or not contains(payload, "type")
         give {"error": declassify("missing_type", "the outcome code is public on-chain"), "error_detail": "payload needs a \"type\": open | bid | cancel_bid | close | cancel | withdraw"}
     -- The payload is private, so branching on it labels everything this branch produces — and
     -- that is fine: the adapter's root sink is {app}, and only the fields that really go on-chain
@@ -166,8 +242,9 @@ task process(ctx)
         otherwise
             give {"error": declassify("unknown_type", "the outcome code is public on-chain"), "error_detail": "unsupported instruction type: " + text(payload["type"])}
 
--- The seller locks `quantity` of the asset and opens the book. The chain learns that an auction
--- opened (asset, quantity, payment token, kind) — not who sells.
+-- The seller locks `quantity` of the asset and opens the book. The public receipt says that an
+-- auction opened (asset, quantity, payment token, kind); the seller is the request's sender, which
+-- the chain shows anyway.
 task open(ctx, state, p)
     when not is_address(field(p, "asset", nothing)) or not is_address(field(p, "payment", nothing))
         give {"error": declassify("missing_tokens", "the outcome code is public on-chain"), "error_detail": "open needs the asset and the payment token addresses"}
@@ -175,10 +252,14 @@ task open(ctx, state, p)
     let payment be lower(p["payment"])
     when asset == payment
         give {"error": declassify("same_token", "the outcome code is public on-chain"), "error_detail": "the asset and the payment token must differ"}
-    let quantity be int_of(field(p, "quantity", "0"))
+    let quantity be amount_in(p, "quantity", "0")
+    when quantity == nothing
+        give bad_amount("quantity")
     when quantity <= 0
         give {"error": declassify("quantity_not_positive", "the outcome code is public on-chain"), "error_detail": "quantity must be positive"}
-    let reserve be int_of(field(p, "reserve", "0"))
+    let reserve be amount_in(p, "reserve", "0")
+    when reserve == nothing
+        give bad_amount("reserve")
     let kind be text(field(p, "kind", "uniform"))
     when kind != "uniform" and kind != "pay_as_bid"
         give {"error": declassify("unknown_kind", "the outcome code is public on-chain"), "error_detail": "kind must be uniform or pay_as_bid"}
@@ -186,6 +267,9 @@ task open(ctx, state, p)
     let have be balance_of(state, seller, asset)
     when have < quantity
         give {"error": declassify("insufficient_asset", "the outcome code is public on-chain"), "error_detail": "the seller holds " + text(have) + " of the asset, the auction needs " + text(quantity)}
+    let open_now be count_open(state, seller)
+    when open_now["mine"] >= MAX_OPEN_PER_SELLER or open_now["all"] >= MAX_OPEN
+        give {"error": declassify("too_many_open", "the outcome code is public on-chain"), "error_detail": "open auctions: " + text(open_now["mine"]) + " of this seller (at most " + text(MAX_OPEN_PER_SELLER) + "), " + text(open_now["all"]) + " in all (at most " + text(MAX_OPEN) + ")"}
     let s0 be prune(state)
     let n be s0["auction_nonce"] + 1
     set s0["auction_nonce"] to n
@@ -208,8 +292,12 @@ task bid(ctx, state, p)
     let bidder be ctx["sender"]
     when bidder == a["seller"]
         give {"error": declassify("seller_cannot_bid", "the outcome code is public on-chain"), "error_detail": "the seller cannot bid"}
-    let quantity be int_of(field(p, "quantity", "0"))
-    let total be int_of(field(p, "total", "0"))
+    let quantity be amount_in(p, "quantity", "0")
+    when quantity == nothing
+        give bad_amount("quantity")
+    let total be amount_in(p, "total", "0")
+    when total == nothing
+        give bad_amount("total")
     when quantity <= 0 or total <= 0
         give {"error": declassify("amount_not_positive", "the outcome code is public on-chain"), "error_detail": "quantity and total must be positive"}
     when quantity > int_of(a["quantity"])
@@ -241,7 +329,9 @@ task cancel_bid(ctx, state, p)
     when not contains(a["bids"], bidder)
         give {"error": declassify("no_bid", "the outcome code is public on-chain"), "error_detail": "no bid of yours in auction " + a["id"]}
     let total be int_of(a["bids"][bidder]["total"])
-    let kept be {}
+    -- Born private: the keys it takes are the bidders, private to the app. A public `{}` here
+    -- passed natively and failed every time inside the guest (DARKPOOL-11).
+    let kept be private({}, "app")
     each k in keys(a["bids"])
         when k != bidder
             set kept[k] to a["bids"][k]
@@ -283,8 +373,27 @@ task above_reserve(a, b)
     -- reserve is a total for the whole quantity: price floor = reserve ÷ quantity
     give int_of(b["total"]) * int_of(a["quantity"]) >= int_of(a["reserve"]) * int_of(b["quantity"])
 
--- The close: matching, settlement from escrow, one encrypted result per bidder, the seller's
--- summary, and a public receipt with the clearing (never with who bid what).
+-- The number of events of a result is public, and a close or a cancel sends one per bidder plus
+-- the seller's. Rounded up to a power of two with padding events to the seller (which every event
+-- of the same size hides, under POLICY), it tells an observer only the bracket: 1 bidder looks like
+-- any other request (2 events), 3 like 2, 100 like 127.
+task bucketed(events, user)
+    -- The count comes from the book, private: everything written from it is born private.
+    let target be private(2, "app")
+    while target < length(events)
+        set target to target * 2
+    let out be private(events, "app")
+    while length(out) < target
+        set out to append(out, {"user": user, "data": {"type": "pad"}})
+    give out
+
+-- The close: matching and settlement from escrow. Each winner gets its fill and what it paid,
+-- each loser only its refund, the seller what sold, the proceeds and how many winners; nobody
+-- gets another bidder's bid, and under uniform pricing not even the clearing bid (DARKPOOL-10).
+-- The seller is not told who the winners are: a list of them would make its event grow with their
+-- number, and its size is public. The book is dropped once settled: a losing bid is never stored,
+-- reported or sent anywhere after this; the winners stay in the result, for the audit.
+-- The public receipt is (auction id, quantity sold, kind).
 task close(ctx, state, p)
     let a be find_auction(state, p)
     when a == nothing
@@ -325,16 +434,20 @@ task close(ctx, state, p)
         when filled > 0
             set s1 to credit(s1, b["bidder"], a["asset"], filled)
         set proceeds to proceeds + paid
-        set results to append(results, {"bidder": b["bidder"], "filled": text(filled), "paid": text(paid)})
-        set events to append(events, {"user": b["bidder"], "data": {"type": "result", "auction": a["id"], "n": a["n"], "filled": text(filled), "paid": text(paid), "refunded": text(refund), "clearing": when clearing == nothing then nothing otherwise {"quantity": clearing["quantity"], "total": clearing["total"]}}})
+        when filled > 0
+            set results to append(results, {"bidder": b["bidder"], "filled": text(filled), "paid": text(paid)})
+        -- The same keys for a winner and a loser: under POLICY both events have the same size.
+        set events to append(events, {"user": b["bidder"], "data": {"type": "result", "auction": a["id"], "n": a["n"], "filled": text(filled), "paid": text(paid), "refunded": text(refund)}})
     let sold be int_of(a["quantity"]) - remaining
     set s1 to credit(s1, a["seller"], a["payment"], proceeds)
     when remaining > 0
         set s1 to credit(s1, a["seller"], a["asset"], remaining)
     set a["status"] to "closed"
-    set a["result"] to {"sold": text(sold), "proceeds": text(proceeds), "clearing": when clearing == nothing then nothing otherwise {"quantity": clearing["quantity"], "total": clearing["total"]}, "fills": results}
-    let s2 be bump(save_auction(s1, a))
-    set events to append(events, {"user": a["seller"], "data": {"type": "cleared", "auction": a["id"], "n": a["n"], "sold": text(sold), "unsold": text(remaining), "proceeds": text(proceeds), "fills": results, "nonce": s2["nonce"]}})
+    set a["result"] to {"sold": text(sold), "proceeds": text(proceeds), "fills": results}
+    set a["bids"] to private({}, "app")
+    let s2 be bump(prune(save_auction(s1, a)))
+    set events to append(events, {"user": a["seller"], "data": {"type": "cleared", "auction": a["id"], "n": a["n"], "sold": text(sold), "unsold": text(remaining), "proceeds": text(proceeds), "winners": text(length(results)), "nonce": s2["nonce"]}})
+    set events to bucketed(events, a["seller"])
     let kind_code be when a["kind"] == "uniform" then 0 otherwise 1
     -- The public receipt says that auction <id> closed having sold <sold> of the asset, and how it
     -- was priced. It does NOT carry `proceeds`: with a single winner — the typical OTC block —
@@ -360,15 +473,18 @@ task cancel(ctx, state, p)
         set s1 to credit(s1, bidder, a["payment"], int_of(a["bids"][bidder]["total"]))
         set events to append(events, {"user": bidder, "data": {"type": "result", "auction": a["id"], "n": a["n"], "filled": "0", "paid": "0", "refunded": a["bids"][bidder]["total"], "cancelled": true}})
     set a["status"] to "cancelled"
-    let s2 be bump(save_auction(s1, a))
+    set a["bids"] to private({}, "app")
+    let s2 be bump(prune(save_auction(s1, a)))
     set events to append(events, {"user": a["seller"], "data": {"type": "cancelled", "auction": a["id"], "n": a["n"], "nonce": s2["nonce"]}})
-    give {"state": s2, "events": events, "fuel": FUEL}
+    give {"state": s2, "events": bucketed(events, a["seller"]), "fuel": FUEL}
 
 task withdraw(ctx, state, p)
     when not is_address(field(p, "token", nothing))
         give {"error": declassify("missing_token", "the outcome code is public on-chain"), "error_detail": "withdraw needs a token address"}
     let token be lower(p["token"])
-    let amount be int_of(field(p, "amount", "0"))
+    let amount be amount_in(p, "amount", "0")
+    when amount == nothing
+        give bad_amount("amount")
     when amount <= 0
         give {"error": declassify("amount_not_positive", "the outcome code is public on-chain"), "error_detail": "amounts must be positive"}
     let have be balance_of(state, ctx["sender"], token)
@@ -381,16 +497,19 @@ task withdraw(ctx, state, p)
     let event be {"type": "withdrawal", "token": token, "to": dest, "amount": text(amount), "balance": text(have - amount), "nonce": s1["nonce"]}
     give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "withdrawals": [declassify({"token": token, "to": dest, "amount": text(amount)}, "the pull-payment settles on-chain: payee, token and amount are public by construction")], "fuel": FUEL}
 
--- Past MAX_CLOSED finished auctions, the oldest go (open ones never do).
+-- Past MAX_CLOSED finished auctions, the oldest go (open ones never do; they are capped at open).
+-- Ids are fixed-width hex of a counter, so key order is age order. Runs on open, close and cancel.
 task prune(state)
-    let closed be 0
+    -- Counted and rebuilt under private control flow (the statuses are {app}): born private. A
+    -- public `kept` here failed inside the guest exactly like cancel_bid's (DARKPOOL-11).
+    let closed be private(0, "app")
     each k in keys(state["auctions"])
         when state["auctions"][k]["status"] != "open"
             set closed to closed + 1
     when closed <= MAX_CLOSED
         give state
-    let kept be {}
-    let dropped be 0
+    let kept be private({}, "app")
+    let dropped be private(0, "app")
     each k in keys(state["auctions"])
         let a be state["auctions"][k]
         when a["status"] != "open" and dropped < closed - MAX_CLOSED
@@ -400,19 +519,32 @@ task prune(state)
     set state["auctions"] to kept
     give state
 
--- The authority's view: the whole book, bids included.
+-- What an allowed authority can read (Vela checks the allowlist; the report is encrypted to the
+-- requester): every balance, every finished auction with its result (sold, proceeds, the winners
+-- and what each paid), and of an open auction only what its public receipt said. An open book is
+-- never in a report — not even an auditor sees a bid before the close — and a losing bid is
+-- dropped at the close, so it is in none.
+task auditable(a)
+    when a["status"] == "open"
+        give public_auction(a)
+    give {"id": a["id"], "n": a["n"], "seller": a["seller"], "asset": a["asset"], "quantity": a["quantity"], "payment": a["payment"], "reserve": a["reserve"], "kind": a["kind"], "status": a["status"], "result": a["result"]}
+
 task deanonymize(ctx)
     let state be ctx["state"]
     let payload be ctx["payload"]
     let report_type be text(field(payload, "report_type", "audit"))
     match report_type
         is "audit"
-            give {"report": {"balances": state["balances"], "auctions": state["auctions"]}, "fuel": FUEL}
+            -- Built from the state ({app}): born private, like the report it becomes.
+            let auctions be private({}, "app")
+            each k in keys(state["auctions"])
+                set auctions[k] to auditable(state["auctions"][k])
+            give {"report": {"balances": state["balances"], "auctions": auctions}, "fuel": FUEL}
         is "auction"
             let a be find_auction(state, payload)
             when a == nothing
                 give {"error": declassify("unknown_auction", "the outcome code is public on-chain"), "error_detail": "unknown auction " + text(field(payload, "auction", ""))}
-            give {"report": a, "fuel": FUEL}
+            give {"report": auditable(a), "fuel": FUEL}
         otherwise
             give {"error": declassify("unknown_report_type", "the outcome code is public on-chain"), "error_detail": "unsupported report type: " + report_type}
 
@@ -588,14 +720,24 @@ test "uniform price: the best bids win, everyone pays the lowest accepted price,
     assert_eq(length(r["app_events"][0]["data_hex"]), 2 + 192)
     -- The seller still learns it, in their own encrypted event.
     assert_eq(r["events"][3]["data"]["proceeds"], "1000000000000000000")
-    -- one result per bidder (losing bids stay private: Carl learns only his own), then the seller's summary
+    -- one result per bidder, then the seller's summary: 4 events, already a power of two
     assert_eq(length(r["events"]), 4)
     assert_eq(r["events"][0]["user"], ANA)
     assert_eq(r["events"][0]["data"]["paid"], "600000000000000000")
     assert_eq(r["events"][2]["user"], CARL)
     assert_eq(r["events"][2]["data"]["filled"], "0")
+    assert_eq(r["events"][2]["data"]["refunded"], "10000000000000000")
+    -- nobody is told another bidder's bid: no clearing bid, no quantity, no total (DARKPOOL-10)
+    each e in r["events"]
+        assert(not contains(e["data"], "clearing"))
+        assert(not contains(e["data"], "total"))
+    -- the seller learns how many won, not who: its event does not grow with the winners
     assert_eq(r["events"][3]["user"], SELLER)
-    assert_eq(length(r["events"][3]["data"]["fills"]), 3)
+    assert_eq(r["events"][3]["data"]["winners"], "2")
+    assert(not contains(r["events"][3]["data"], "fills"))
+    -- the book is dropped once settled; the stored result keeps only the winners
+    assert_eq(s["auctions"][ID1]["bids"], {})
+    assert_eq(length(s["auctions"][ID1]["result"]["fills"]), 2)
 
 test "pay-as-bid: each winner pays its own price"
     let s be send(with_bids("pay_as_bid"), SELLER, {"type": "close", "auction": ID1})["state"]
@@ -630,12 +772,25 @@ test "withdrawals are pull-payments from a balance, per token"
     assert_eq(balance_of(r["state"], ANA, TST), 0)
     assert_eq(send(r["state"], ANA, {"type": "withdraw", "token": TST, "amount": "1"})["error"], "insufficient_balance")
 
-test "the audit sees the whole book; the chain never did"
+task audit(s, payload)
+    give deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": private(payload, "app"), "payload_hex": nothing, "state": private(s, "app")})
+
+test "the audit reads balances and finished results, never an open book"
     let s be send(with_bids("uniform"), SELLER, {"type": "close", "auction": ID1})["state"]
-    let all be deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": private({}, "app"), "payload_hex": nothing, "state": private(s, "app")})
-    assert_eq(length(keys(all["report"]["auctions"][ID1]["bids"])), 3)
-    let one be deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": private({"report_type": "auction", "auction": ID1}, "app"), "payload_hex": nothing, "state": private(s, "app")})
-    assert_eq(one["report"]["result"]["sold"], "1000000000")
+    set s to dep(s, SELLER, TST, "50")
+    set s to send(s, SELLER, {"type": "open", "asset": TST, "quantity": "50", "payment": ETH})["state"]
+    set s to send(s, ANA, {"type": "bid", "auction": "0x00000000000000000000000000000002", "quantity": "50", "total": "123456789"})["state"]
+    let all be audit(s, {})
+    assert_eq(all["report"]["auctions"][ID1]["result"]["sold"], "1000000000")
+    assert_eq(length(all["report"]["auctions"][ID1]["result"]["fills"]), 2)
+    assert(not contains(all["report"]["auctions"][ID1], "bids"))
+    -- the open auction: only what its public receipt said
+    let open_one be all["report"]["auctions"]["0x00000000000000000000000000000002"]
+    assert_eq(open_one["status"], "open")
+    assert(not contains(open_one, "bids"))
+    assert(not contains(json_encode(all["report"]), "123456789"))
+    assert_eq(audit(s, {"report_type": "auction", "auction": ID1})["report"]["result"]["sold"], "1000000000")
+    assert(not contains(audit(s, {"report_type": "auction", "auction": "0x00000000000000000000000000000002"})["report"], "bids"))
     assert_eq(send(s, SELLER, {"type": "mint"})["error"], "unknown_type")
 
 -- Maps are values since v0.6.29: a call never changes the state it was given, so `before` is safe
@@ -663,10 +818,92 @@ test "every error is a code; the detail keeps the numbers; the policy passes thr
     assert_eq(poor["error"], "insufficient_balance")
     assert(starts_with(poor["error_detail"], "the bidder holds 2000000000000000000"))
     assert_eq(send(funded(), SELLER, {"amount": "1"})["error"], "missing_type")
-    let p be deploy({"app_id": 1, "kind": "deploy", "params": {"policy": {"reject": "private", "events_min": 2}}})
-    assert_eq(p["policy"], {"reject": "private", "events_min": 2})
+    -- private by default: no constructor parameters give the private policy (DARKPOOL-02)
+    assert_eq(deploy({"app_id": 1, "kind": "deploy", "params": nothing})["policy"], POLICY)
+    assert_eq(deploy({"app_id": 1, "kind": "deploy", "params": {}})["policy"], POLICY)
+    assert_eq(POLICY["reject"], "private")
+    assert_eq(POLICY["fuel"], FUEL)
+    let p be deploy({"app_id": 1, "kind": "deploy", "params": {"policy": {"reject": "public"}}})
+    assert_eq(p["policy"], {"reject": "public"})
     assert_eq(p["fuel"], FUEL)
-    assert(not contains(deploy({"app_id": 1, "kind": "deploy", "params": nothing}), "policy"))
+    assert_eq(load_module({"app_id": 1, "kind": "load_module"})["policy"], POLICY)
+
+test "a malformed amount or payload is the app's refusal, never a runtime error"
+    each bad in ["1.5", "-1", "", " ", "0x10", "1e18", "12a", 7, nothing, {"x": 1}, ["1"], "115792089237316195423570985008687907853269984665640564039457584007913129639936"]
+        let r be send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": bad, "total": "1"})
+        -- nothing is "absent": the default "0" applies and the bid is not positive
+        assert_eq(r["error"], when bad == nothing then "amount_not_positive" otherwise "bad_amount")
+    assert_eq(send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "1", "total": "0.5"})["error"], "bad_amount")
+    assert_eq(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1", "payment": ETH, "reserve": "-5"})["error"], "bad_amount")
+    assert_eq(send(funded(), ANA, {"type": "withdraw", "token": ETH, "amount": "1.0"})["error"], "bad_amount")
+    -- 2^256 - 1 is still an amount (refused for the balance, not for its shape)
+    assert_eq(send(funded(), ANA, {"type": "withdraw", "token": ETH, "amount": MAX_UINT})["error"], "insufficient_balance")
+    let st be funded()
+    each payload in [[], "bid", 5, nothing]
+        assert_eq(process({"app_id": 1, "sender": ANA, "request_type": 1, "kind": "process", "payload": private(payload, "app"), "payload_hex": nothing, "state": private(st, "app")})["error"], "missing_type")
+    -- a padded payload: unknown keys are ignored
+    let padded be send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "900000000000000000", "_": "          "})
+    assert(not contains(padded, "error"))
+
+test "no trigger: trusted requests and other request types are refused by name"
+    assert_eq(trusted({"app_id": 1, "kind": "trusted", "payload": {"type": "withdraw"}, "state": funded()})["error"], "no_trigger")
+    let r be process({"app_id": 1, "sender": ANA, "request_type": 4, "kind": "process", "payload": private({"type": "withdraw", "token": ETH, "amount": "1"}, "app"), "payload_hex": nothing, "state": private(funded(), "app")})
+    assert_eq(r["error"], "unsupported_request")
+
+test "open auctions are capped per seller and in total"
+    let s be funded()
+    let sellers be []
+    each i in range(8)
+        let who be hex_of(int_to_bytes(5000 + i, 20))
+        set sellers to append(sellers, who)
+        set s to dep(s, who, TST, "100")
+    each i in range(3)
+        set s to send(s, sellers[0], {"type": "open", "asset": TST, "quantity": "1", "payment": ETH})["state"]
+    assert_eq(send(s, sellers[0], {"type": "open", "asset": TST, "quantity": "1", "payment": ETH})["error"], "too_many_open")
+    let opened_n be 3
+    each who in slice(sellers, 1, 8)
+        each i in range(3)
+            when opened_n < MAX_OPEN
+                let r be send(s, who, {"type": "open", "asset": TST, "quantity": "1", "payment": ETH})
+                assert(not contains(r, "error"))
+                set s to r["state"]
+                set opened_n to opened_n + 1
+    assert_eq(count_open(s, "")["all"], MAX_OPEN)
+    let last be send(s, sellers[7], {"type": "open", "asset": TST, "quantity": "1", "payment": ETH})
+    assert_eq(last["error"], "too_many_open")
+    -- a closed auction frees its slot
+    set s to send(s, sellers[0], {"type": "cancel", "auction": ID1})["state"]
+    assert(not contains(send(s, sellers[7], {"type": "open", "asset": TST, "quantity": "1", "payment": ETH}), "error"))
+
+test "an emptied balance leaves no row; the history is pruned on close and cancel"
+    let s be send(with_bids("uniform"), SELLER, {"type": "close", "auction": ID1})["state"]
+    set s to send(s, ANA, {"type": "withdraw", "token": TST, "amount": "600000000"})["state"]
+    assert(not contains(s["balances"][ANA], TST))
+    set s to send(s, CARL, {"type": "withdraw", "token": ETH, "amount": "2000000000000000000"})["state"]
+    assert(not contains(s["balances"], CARL))
+    set s to dep(s, SELLER, TST, "1000")
+    each i in range(MAX_CLOSED + 5)
+        let id be hex_of(int_to_bytes(i + 2, 16))
+        set s to send(s, SELLER, {"type": "open", "asset": TST, "quantity": "10", "payment": ETH})["state"]
+        set s to send(s, BOB, {"type": "bid", "auction": id, "quantity": "10", "total": "1000"})["state"]
+        set s to send(s, SELLER, {"type": when i % 2 == 0 then "close" otherwise "cancel", "auction": id})["state"]
+    assert_eq(length(keys(s["auctions"])), MAX_CLOSED)
+
+test "the events of a close are rounded up to a power of two"
+    assert_eq(length(bucketed([1], SELLER)), 2)
+    assert_eq(length(bucketed([1, 2, 3], SELLER)), 4)
+    assert_eq(length(bucketed([1, 2, 3, 4, 5], SELLER)), 8)
+    assert_eq(length(bucketed(range(201), SELLER)), 256)
+    assert_eq(bucketed([1, 2, 3], SELLER)[3], {"user": SELLER, "data": {"type": "pad"}})
+    -- one bidder: 2 events, like any other request under the policy
+    let s be send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "900000000000000000"})["state"]
+    assert_eq(length(send(s, SELLER, {"type": "close", "auction": ID1})["events"]), 2)
+    -- four bidders and the seller: 8
+    let w be with_bids("uniform")
+    set w to dep(w, "0x5555555555555555555555555555555555555555", ETH, "1000")
+    set w to send(w, "0x5555555555555555555555555555555555555555", {"type": "bid", "auction": ID1, "quantity": "1", "total": "1000"})["state"]
+    assert_eq(length(send(w, SELLER, {"type": "close", "auction": ID1})["events"]), 8)
+    assert_eq(length(send(w, SELLER, {"type": "cancel", "auction": ID1})["events"]), 8)
 
 test "invariants: open, bid, close, cancel, withdraw and deposit conserve balances plus escrow"
     let s be funded()

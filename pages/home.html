@@ -20,7 +20,7 @@
   h2{font:500 12.5px/1.3 var(--sans);color:var(--ink-3);margin:0 0 10px}
   .mono{font-family:var(--mono);font-size:.92em;overflow-wrap:anywhere}
   .dim{color:var(--ink-2)}.small{font-size:.88em}
-  .flash{padding:10px 12px;border-radius:8px;border:1px solid var(--rule);margin:0 0 14px;background:var(--card)}.flash.ok{border-color:#bfe3cf;background:var(--ok-bg);color:var(--ok)}.flash.err{border-color:#e9c1c1;background:var(--no-bg);color:var(--no)}
+  .flash{padding:10px 12px;border-radius:8px;border:1px solid var(--rule);margin:0 0 14px;background:var(--card)}.flash.ok{border-color:#bfe3cf;background:var(--ok-bg);color:var(--ok)}.flash.err{border-color:#e9c1c1;background:var(--no-bg);color:var(--no)}.flash.warn{border-color:#e6d3a0;background:var(--warn-bg);color:var(--warn)}
   form{margin:0}label{display:block;font-size:13px;color:var(--ink-2);margin:10px 0 4px}
   .two{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}@media(max-width:560px){.two{grid-template-columns:1fr}}
   input[type=text],select,textarea{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--rule);border-radius:7px;font:inherit;background:#fff}
@@ -42,6 +42,7 @@
 <main>
   <h1>Dark pool on Vela</h1>
   <p class="lead">A seller offers a block of the stack's token for ETH. Bidders send their bids encrypted to the enclave; nobody sees a bid before the close; the matching runs inside; winners and losers are settled from escrow, and the losing bids are never revealed. This console plays every side on a devnet: the seller's desk here, and a desk per bidder it sets up. Every action is one request to the enclave, 30 to 60 s.</p>
+  { when open_console }<p class="flash warn">A single-operator demo: this console holds every desk’s keys, so whoever reaches this page can act for every side and read every desk’s results. Run it on your own machine (it listens on 127.0.0.1), or set CONSOLE_PASSWORD. A real bidder uses the command-line client with a wallet of their own.</p>{ end }
   { when ok != "" }<p class="flash ok">{ ok }</p>{ end }
   { when err != "" }<p class="flash err">{ err }</p>{ end }
   { when note != "" }<p class="flash err">{ note }</p>{ end }

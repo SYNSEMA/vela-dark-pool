@@ -5,8 +5,8 @@
 -- The slot's layout and the work live in embed_lib.syn, which the kit's web app uses too.
 intent: "embed a .syn program into the app slot of a Vela guest module"
 
-require file.read("*")
-require file.write("*")
+require file.read("./**")
+require file.write("./**")
 
 use "./embed_lib.syn" as slot
 

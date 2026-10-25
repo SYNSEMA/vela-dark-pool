@@ -6,18 +6,19 @@
 
 name = "Dark pool"
 slug = "vela-dark-pool"
-version = "0.3.1"
+version = "0.4.0"
 kind = "web"
 entry = "web.syn"
 engine = "0.6"
-tagline = "A dark pool for block trades on Horizen's Vela, in Synsema: orders go in encrypted, the enclave matches them, settlement comes from escrow; nobody sees the book, and losing orders are never revealed."
-tagline_es = "Un dark pool para operaciones en bloque en Vela (Horizen) con Synsema: las órdenes entran cifradas, el enclave las cruza, la liquidación sale del escrow; nadie ve el libro y las órdenes perdedoras nunca se revelan."
-tagline_pt = "Um dark pool para operações em bloco no Vela (Horizen) com Synsema: as ordens entram cifradas, o enclave as cruza, a liquidação sai do escrow; ninguém vê o livro e as ordens perdedoras nunca são reveladas."
+tagline = "A dark pool for block trades on Horizen's Vela, in Synsema: orders go in encrypted, the enclave matches them, settlement comes from escrow; nobody sees the book before the close, and losing orders are never revealed."
+tagline_es = "Un dark pool para operaciones en bloque en Vela (Horizen) con Synsema: las órdenes entran cifradas, el enclave las cruza, la liquidación sale del escrow; nadie ve el libro antes del cierre y las órdenes perdedoras nunca se revelan."
+tagline_pt = "Um dark pool para operações em bloco no Vela (Horizen) com Synsema: as ordens entram cifradas, o enclave as cruza, a liquidação sai do escrow; ninguém vê o livro antes do fechamento e as ordens perdedoras nunca são reveladas."
 
 [secrets]
 VELA_SECP_KEY = "the seller's secp256k1 key: signs the transactions and pays the fees (hex). On the public devnet the token comes with an account of its own: a deployer with ETH and test tokens, whose wallet also funds the demo bidders."
 VELA_ADMIN_KEY = "the admin key when the kit signs allow-token and allow-authority itself (a devnet of your own). Empty on the public devnet, whose admin desk signs them (VELA_ADMIN_URL), and on a local kit, where the signing key is the admin."
 VELA_P521_KEY = "P-521 private key for the encrypted channel with the Executor (hex). Provisioned on the devnet; made by the app itself when empty."
+CONSOLE_PASSWORD = "optional: when set, every page of the console asks for it first. The console holds every desk's keys; empty, it is open to whoever reaches it (the public demo on devnet money, which says so on every page)."
 
 # The public Vela devnet by default: the provision URL hands out a token of your own and fills these
 # (and the keys) when the project is created. Point them at your own Vela stack to leave the devnet.
@@ -29,6 +30,8 @@ VELA_PROCESSOR = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
 VELA_TEE_AUTHENTICATOR = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 VELA_TOKEN = ""
 VELA_MAX_FEE = "100"
+# The console listens on 127.0.0.1 by default; on the platform the runner reaches it from outside its container.
+CONSOLE_BIND = "0.0.0.0"
 
 [provision]
 env_url = "https://devnet.synsema.app/token"

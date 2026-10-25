@@ -1,44 +1,64 @@
-# Tests the app and the client natively, builds the Vela guest from app/app.syn (the
-# release's guest module + your program, no compiler), probes it the way the Executor drives it
-# (Node 24 WASI and wasmtime-go v1.0.0), and publishes build/app.wasm as a downloadable artifact.
+# Tests the app and the client natively, builds the Vela guest from app/app.syn (the release's guest
+# module, pinned by hash and by its build provenance, + your program, no compiler), runs the app on
+# Vela's own runtime (pkg/wasm, the code the Executor runs) and publishes build/app.wasm.
+# Every action is pinned by commit; the tag it was is in the comment.
 name: auction guest
 
 on: [push, pull_request, workflow_dispatch]
 
+permissions:
+  contents: read
+
 env:
-  SYNSEMA_TAG: v0.6.29
-  # The Go probe sends a process_request; set repository variables if your app's instructions differ.
-  DEPLOY_PARAMS: ${{ vars.VELA_DEPLOY_PARAMS || '' }}
-  PAYLOAD: ${{ vars.VELA_SMOKE_PAYLOAD || '{"type":"withdraw","token":"0x0000000000000000000000000000000000000000","amount":"1"}' }}
+  SYNSEMA_TAG: v0.6.47
+  # The guest's hash, the same one scripts/build.sh pins.
+  GUEST_SHA256: 133d0f13ea214e7ca572d7c169e0e57b97057df6eb9f832c6ea036d53ac46cb0
+  # Vela's runtime the app is tested on (its go.mod pins wasmtime-go v1.0.0, as the Executor does).
+  VELA_VERSION: v0.2.1-snapshot1
 
 jobs:
   guest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
-      - name: Install the released Synsema binary
-        run: npm i -g synsema@${SYNSEMA_TAG#v} && synsema version
+      - name: Install the released Synsema binary (checked against its build provenance)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release download "$SYNSEMA_TAG" -R kitecosmic/synsema --pattern synsema-linux-x86_64 -O synsema
+          gh attestation verify synsema --repo kitecosmic/synsema --signer-workflow kitecosmic/synsema/.github/workflows/release.yml
+          chmod +x synsema && sudo mv synsema /usr/local/bin/synsema && synsema version
       - name: Test the app and the client natively
         run: |
           synsema test --labels app/app.syn
           synsema check web.syn
           (cd client && synsema test vela_client.syn)
           synsema test scripts/embed.syn
-      - name: Build the guest (the release's module + app/app.syn)
+      - name: Fetch the guest and check its build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p .synsema
+          gh release download "$SYNSEMA_TAG" -R kitecosmic/synsema --pattern synsema-vela-guest.wasm -O ".synsema/synsema-vela-guest-$SYNSEMA_TAG.wasm"
+          gh attestation verify ".synsema/synsema-vela-guest-$SYNSEMA_TAG.wasm" --repo kitecosmic/synsema --signer-workflow kitecosmic/synsema/.github/workflows/release.yml
+      - name: Build the module (the pinned guest + app/app.syn)
         run: sh scripts/build.sh
       - name: Smoke under Node WASI (imports, exports, load_module, deploy, determinism)
         run: node scripts/smoke.mjs build/app.wasm
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.22"
-      - name: Probe under wasmtime-go v1.0.0 (the Executor's runtime)
-        run: |
-          git clone -q --depth 1 --branch "$SYNSEMA_TAG" https://github.com/kitecosmic/synsema.git .synsema/src
-          cd .synsema/src/packages/guests/vela/tests/wasmtime-go && go run . "$GITHUB_WORKSPACE/build/app.wasm"
-      - uses: actions/upload-artifact@v4
+          go-version: "1.24"
+          cache-dependency-path: tests/vela/go.sum
+      - name: The app on Vela's runtime (tests/vela)
+        run: cd tests/vela && go test -count=1 -v ./...
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: app.wasm
           path: |

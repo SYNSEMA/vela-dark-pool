@@ -5,11 +5,16 @@
 -- custodies, given some ETH from the seller's wallet — and the enclave treats those bidders exactly
 -- as it treats one with a wallet of their own (who uses the CLI with their own .env).
 --
--- What it keeps (data/auction.json, on the project's volume): the app id, the P-521 pair it made
--- when none came from the environment, the bidders with their keys, the auctions it opened.
+-- A SINGLE-OPERATOR DEMO: whoever runs it holds every desk's keys (data/auction.json keeps the
+-- seller's P-521 pair, each desk's wallet key and P-521 pair, in clear), so whoever reads that file
+-- or reaches the page can act for, and read the results of, every side. Each desk seals its bids
+-- with its own P-521 key, as a bidder with a wallet of their own does with the CLI; what a real
+-- bidder sends, nobody but them and the enclave reads. It listens on 127.0.0.1 unless CONSOLE_BIND
+-- says otherwise; with CONSOLE_PASSWORD set, every page asks for it first.
 -- Every action is one request to the enclave: 30 to 60 seconds on a devnet.
 --
 --   synsema serve web.syn            (from the repository root; .env there = `vela_client.syn -- devnet`)
+--   CONSOLE_BIND=0.0.0.0 CONSOLE_PASSWORD=<password> synsema serve web.syn   (reachable from elsewhere)
 intent: "dark pool console: sealed orders matched inside the enclave on Vela, from the browser — the seller's desk and a desk per buyer"
 
 require serve(8080)
@@ -21,7 +26,9 @@ require net("objects.githubusercontent.com")
 require net("release-assets.githubusercontent.com")
 require env("VELA_*")
 require env("SYNSEMA_*")
+require env("CONSOLE_*")
 require secret("VELA_*")
+require secret("CONSOLE_*")
 require sign("VELA_SECP_KEY")
 require sign("VELA_USER_KEY")
 require random
@@ -38,10 +45,15 @@ use "./scripts/embed_lib.syn" as slot
 let ETH be "0x0000000000000000000000000000000000000000"
 let PROCESS be 1
 let ASSOCIATE_KEY be 3
-let GUEST_TAG be env("SYNSEMA_GUEST_TAG", "v0.6.29")
+-- The guest is pinned by its hash, written here, like scripts/build.sh does: a release's own .sha256
+-- comes from the same place as the module and proves nothing about it (DARKPOOL-03).
+let GUEST_TAG be env("SYNSEMA_GUEST_TAG", "v0.6.47")
+let GUEST_SHA256 be env("SYNSEMA_GUEST_SHA256", "133d0f13ea214e7ca572d7c169e0e57b97057df6eb9f832c6ea036d53ac46cb0")
 -- The guest cached per release: bumping GUEST_TAG downloads the new one instead of reusing the old.
 let GUEST_CACHE be "data/guest-" + GUEST_TAG + ".wasm"
 let STATE be "data/auction.json"
+-- Where the console listens: this machine only, unless CONSOLE_BIND names another address.
+let BIND be when env("CONSOLE_BIND", "") == "" then "127.0.0.1" otherwise env("CONSOLE_BIND", "")
 
 -- ---- state on the volume ----
 
@@ -81,6 +93,13 @@ task p521_pair(s)
 
 task seller()
     give v.secp_key()
+
+-- A desk's own P-521 pair (bids sealed and results read with it); desks made before v0.4.0 have
+-- none and keep using the console's.
+task desk_pair(s, b)
+    when contains(b, "p521_key") and b["p521_key"] != ""
+        give {"key": v.p521_of(b["p521_key"]), "pub": v.hex_bytes(b["p521_pub"])}
+    give p521_pair(s)
 
 task bidder_key(b)
     give v.secp_of(b["key"], "VELA_USER_KEY")
@@ -146,8 +165,9 @@ task field(m, key, default)
         give m[key]
     give default
 
+-- Padded to 256 bytes before sealing: the size of a ciphertext is public (vela_lib.padded).
 task encrypted(c, keys, plain)
-    give v.seal(v.derive_key(keys["key"], v.tee_public_key(c)), bytes(json_encode(plain)))
+    give v.seal(v.derive_key(keys["key"], v.tee_public_key(c)), bytes(json_encode(v.padded(plain, 256))))
 
 task qs(msg)
     let m be replace(text(msg), "%", "%25")
@@ -215,15 +235,14 @@ task line_of(c, s, ev)
     when t == "bid_cancelled"
         give "bid cancelled · #" + a["n"] + " · refunded " + human(c, a["payment"], ev["refunded"])
     when t == "result"
-        let clearing be when contains(ev, "clearing") and ev["clearing"] != nothing then " · clearing " + price_of(c, a["asset"], a["payment"], ev["clearing"]["quantity"], ev["clearing"]["total"]) otherwise ""
         when contains(ev, "cancelled") and ev["cancelled"]
             give "result · #" + a["n"] + " · the seller cancelled; refunded " + human(c, a["payment"], ev["refunded"])
-        give "result · #" + a["n"] + " · filled " + human(c, a["asset"], ev["filled"]) + " · paid " + human(c, a["payment"], ev["paid"]) + " · refunded " + human(c, a["payment"], ev["refunded"]) + clearing
+        when v.int_of(text(ev["filled"])) == 0
+            give "result · #" + a["n"] + " · not filled; refunded " + human(c, a["payment"], ev["refunded"])
+        give "result · #" + a["n"] + " · filled " + human(c, a["asset"], ev["filled"]) + " · paid " + human(c, a["payment"], ev["paid"]) + " (" + price_of(c, a["asset"], a["payment"], ev["filled"], ev["paid"]) + ") · refunded " + human(c, a["payment"], ev["refunded"])
     when t == "cleared"
-        let fills be []
-        each f in ev["fills"]
-            set fills to append(fills, short(f["bidder"]) + " " + human(c, a["asset"], f["filled"]) + " for " + human(c, a["payment"], f["paid"]))
-        give "cleared · #" + a["n"] + " · sold " + human(c, a["asset"], ev["sold"]) + " · unsold " + human(c, a["asset"], ev["unsold"]) + " · proceeds " + human(c, a["payment"], ev["proceeds"]) + (when length(fills) == 0 then " · no fills" otherwise " · " + join(fills, "; "))
+        let winners be when contains(ev, "winners") then text(ev["winners"]) otherwise "?"
+        give "cleared · #" + a["n"] + " · sold " + human(c, a["asset"], ev["sold"]) + " · unsold " + human(c, a["asset"], ev["unsold"]) + " · proceeds " + human(c, a["payment"], ev["proceeds"]) + " · " + winners + (when winners == "1" then " winner" otherwise " winners")
     when t == "cancelled"
         give "cancelled · #" + a["n"] + " · every bid refunded"
     give t
@@ -232,7 +251,7 @@ task lines_of(c, s, keys, secp, limit)
     let out be []
     try
         each item in v.events_with(c, keys["key"], secp, limit)
-            when contains(item, "event") and contains(item["event"], "type")
+            when contains(item, "event") and contains(item["event"], "type") and item["event"]["type"] != "pad"
                 set out to append(out, {"block": item["block"], "line": line_of(c, s, item["event"])})
     recover e
         set out to append(out, {"block": "", "line": "could not read the events: " + text(e)})
@@ -264,6 +283,10 @@ task do_deploy(s)
     otherwise
         set guest to slot.release_guest(GUEST_TAG)
         write_file(GUEST_CACHE, guest)
+    let got be decode(sha256(guest), "hex")
+    when got != GUEST_SHA256
+        raise("the guest of " + GUEST_TAG + " is not the pinned one (sha256 " + got + ", wanted " + GUEST_SHA256 + ")")
+    -- No constructor parameters: the app deploys with its private output policy by default.
     let wasm be slot.embed(guest, read_file("app/app.syn"), "app.syn")
     let ids be v.deploy_bytes(c, wasm, {}, nothing)
     v.wait_completed(c, ids["request_id"], true)
@@ -288,8 +311,9 @@ task do_fund(s, amount)
 -- funded by itself — two requests
 task do_bidder(s, name, eth, deposit)
     let c be config(s)
-    set s to with_p521(s)
-    let keys be p521_pair(s)
+    let kp be ecdh_keypair("P-521")
+    let desk be {"name": name, "address": "", "key": "", "p521_key": decode(reveal(kp["private"]), "hex"), "p521_pub": decode(kp["public"], "hex")}
+    let keys be desk_pair(s, desk)
     let key be decode(random_bytes(32), "hex")
     let secret be v.secp_of(key, "VELA_USER_KEY")
     let address be evm_address(secret)
@@ -298,7 +322,9 @@ task do_bidder(s, name, eth, deposit)
     v.wait_completed(c, id, false)
     let id2 be v.submit_as(c, secret, PROCESS, bytes(""), ETH, v.int_of(units(c, ETH, deposit)))
     v.wait_completed(c, id2, false)
-    set s["bidders"] to append(s["bidders"], {"name": name, "address": address, "key": key})
+    set desk["address"] to address
+    set desk["key"] to key
+    set s["bidders"] to append(s["bidders"], desk)
     save(s)
     give name + " (" + address + ") has " + eth + " ETH in the wallet and " + deposit + " ETH in the app"
 
@@ -324,7 +350,7 @@ task do_bid(s, b, n, quantity, total)
     when a == nothing
         raise("no auction #" + n)
     let plain be {"type": "bid", "auction": a["id"], "quantity": units(c, a["asset"], quantity), "total": units(c, a["payment"], total)}
-    let id be v.submit_as(c, bidder_key(b), PROCESS, encrypted(c, p521_pair(s), plain), ETH, 0)
+    let id be v.submit_as(c, bidder_key(b), PROCESS, encrypted(c, desk_pair(s, b), plain), ETH, 0)
     v.wait_completed(c, id, false)
     give "sealed: " + b["name"] + " bids " + quantity + " " + symbol_of(c, a["asset"]) + " for " + total + " ETH (" + price_of(c, a["asset"], a["payment"], plain["quantity"], plain["total"]) + ")"
 
@@ -333,7 +359,7 @@ task do_cancel_bid(s, b, n)
     let a be find_auction(s, n)
     when a == nothing
         raise("no auction #" + n)
-    let id be v.submit_as(c, bidder_key(b), PROCESS, encrypted(c, p521_pair(s), {"type": "cancel_bid", "auction": a["id"]}), ETH, 0)
+    let id be v.submit_as(c, bidder_key(b), PROCESS, encrypted(c, desk_pair(s, b), {"type": "cancel_bid", "auction": a["id"]}), ETH, 0)
     v.wait_completed(c, id, false)
     give b["name"] + "'s bid on #" + n + " is cancelled; the escrow is back"
 
@@ -354,10 +380,10 @@ task do_close(s, n, kind)
     give "auction #" + n + " cleared: sold " + human(c, a["asset"], ev["sold"]) + " for " + human(c, a["payment"], ev["proceeds"])
 
 -- a balance out of the app: a pull-payment the enclave grants, then the on-chain claim
-task do_withdraw(s, key, holder, token_name, amount)
+task do_withdraw(s, keys, key, holder, token_name, amount)
     let c be config(s)
     let token be token_of(c, token_name)
-    let id be v.submit_as(c, key, PROCESS, encrypted(c, p521_pair(s), {"type": "withdraw", "token": token, "amount": units(c, token, amount)}), ETH, 0)
+    let id be v.submit_as(c, key, PROCESS, encrypted(c, keys, {"type": "withdraw", "token": token, "amount": units(c, token, amount)}), ETH, 0)
     v.wait_completed(c, id, false)
     v.send_tx(c, v.need(c, "processor", "VELA_PROCESSOR"), 0, abi_encode("claim(address,address)", [token, holder]))
     give amount + " " + symbol_of(c, token) + " withdrawn and claimed into " + holder
@@ -378,7 +404,7 @@ task overview(s, ok, err)
     let c be config(s)
     let token be c["token"]
     let d be {"ok": ok, "err": err, "host": host_of(v.need(c, "rpc", "VELA_RPC_URL")), "seller": "", "seller_short": "", "eth": "", "token": token, "token_short": short(token), "symbol": "", "token_wallet": "", "claim_eth": "", "claim_token": "",
-              "app_id": s["app_id"], "deployed": s["app_id"] != "", "auctions": [], "bidders": [], "events": [], "chain": [], "note": ""}
+              "app_id": s["app_id"], "deployed": s["app_id"] != "", "auctions": [], "bidders": [], "events": [], "chain": [], "note": "", "open_console": not password_set()}
     -- without the stack's token there is nothing to sell: say so instead of failing
     when token == ""
         set d["note"] to "VELA_TOKEN is empty: the environment was not provisioned. Set it (the devnet hands it out as VELA_TEST_TOKEN) and redeploy."
@@ -398,22 +424,27 @@ task overview(s, ok, err)
         let cleared be {}
         try
             each item in v.events_with(c, keys["key"], seller(), 30)
-                when contains(item, "event") and contains(item["event"], "type")
+                when contains(item, "event") and contains(item["event"], "type") and item["event"]["type"] != "pad"
                     let ev be item["event"]
                     when ev["type"] == "cleared" and not contains(cleared, text(ev["n"]))
                         set cleared[text(ev["n"])] to ev
                     set d["events"] to append(d["events"], {"block": item["block"], "line": line_of(c, s, ev)})
             each item in v.app_events(c, 10)
                 let data be v.hex_bytes(item["data"])
-                when item["label"] == "opened"
-                    let x be abi_decode("(bytes16,address,uint256,address,uint8)", data)
-                    set d["chain"] to append(d["chain"], {"block": item["block"], "line": "opened · #" + text(bytes_to_int(x[0])) + " · " + human(c, lower(x[1]), x[2]) + " for " + symbol_of(c, lower(x[3])) + " · " + (when x[4] == 0 then "uniform" otherwise "pay as bid")})
-                when item["label"] == "cleared"
-                    -- (bytes16 id, uint256 sold, uint8 kind): no proceeds on-chain any more.
-                    let x be abi_decode("(bytes16,uint256,uint8)", data)
-                    let a be find_auction(s, text(bytes_to_int(x[0])))
-                    when a != nothing
-                        set d["chain"] to append(d["chain"], {"block": item["block"], "line": "cleared · #" + a["n"] + " · sold " + human(c, a["asset"], x[1]) + " · " + (when x[2] == 0 then "uniform" otherwise "pay as bid")})
+                -- One receipt that does not decode (an app deployed by an older version wrote
+                -- `cleared` with four words) is skipped, not the whole list.
+                try
+                    when item["label"] == "opened"
+                        let x be abi_decode("(bytes16,address,uint256,address,uint8)", data)
+                        set d["chain"] to append(d["chain"], {"block": item["block"], "line": "opened · #" + text(bytes_to_int(x[0])) + " · " + human(c, lower(x[1]), x[2]) + " for " + symbol_of(c, lower(x[3])) + " · " + (when x[4] == 0 then "uniform" otherwise "pay as bid")})
+                    when item["label"] == "cleared"
+                        -- (bytes16 id, uint256 sold, uint8 kind): no proceeds on-chain any more.
+                        let x be abi_decode("(bytes16,uint256,uint8)", data)
+                        let a be find_auction(s, text(bytes_to_int(x[0])))
+                        when a != nothing
+                            set d["chain"] to append(d["chain"], {"block": item["block"], "line": "cleared · #" + a["n"] + " · sold " + human(c, a["asset"], x[1]) + " · " + (when x[2] == 0 then "uniform" otherwise "pay as bid")})
+                recover e
+                    set d["chain"] to append(d["chain"], {"block": item["block"], "line": item["label"] + " · a receipt this version does not read"})
         recover e
             set d["note"] to "could not read the enclave's events: " + text(e)
         set d["auctions"] to auction_rows(c, s, cleared)
@@ -427,61 +458,95 @@ task bidder_page(s, b, i, ok, err)
     let c be config(s)
     let token be v.app_token(c)
     let d be {"ok": ok, "err": err, "name": b["name"], "address": b["address"], "address_short": short(b["address"]), "i": i, "symbol": symbol_of(c, token), "eth": wallet(c, ETH, b["address"]), "tokens": wallet(c, token, b["address"]),
-              "claim_eth": claimable(c, ETH, b["address"]), "claim_token": claimable(c, token, b["address"]), "open": [], "events": []}
+              "claim_eth": claimable(c, ETH, b["address"]), "claim_token": claimable(c, token, b["address"]), "open": [], "events": [], "open_console": not password_set()}
     each a in reverse(s["auctions"])
         when a["status"] == "open"
             set d["open"] to append(d["open"], {"n": a["n"], "quantity": human(c, a["asset"], a["quantity"]), "reserve": human(c, a["payment"], a["reserve"]), "kind": a["kind"], "asset": symbol_of(c, a["asset"])})
-    set d["events"] to lines_of(c, s, p521_pair(s), bidder_key(b), 30)
+    set d["events"] to lines_of(c, s, desk_pair(s, b), bidder_key(b), 30)
     give render("pages/bidder.html", d)
 
+-- ---- who may use it ----
+
+task password_set()
+    give env("CONSOLE_PASSWORD", "") != ""
+
+-- Without CONSOLE_PASSWORD the console is open to whoever reaches it (by default only this
+-- machine: it listens on 127.0.0.1); with it, a session cookie from /login is needed everywhere.
+task check_session(token, request)
+    when not password_set()
+        give {"operator": "anyone who reaches the page"}
+    let sid be get(request.cookies, "console", nothing)
+    when sid == nothing
+        give nothing
+    give state_get("session:" + sid, nothing)
+
+task to_login(status, message, request)
+    when status == 401
+        give redirect("/login", 302)
+    give nothing
+
 serve on 8080
+    bind BIND
     timeout 300
-    route "GET /"
+    auth with check_session
+    errors with to_login
+    route "GET /login"
+        give render("pages/login.html", {"err": text(field(query, "err", "")), "needed": password_set()})
+    route "POST /login"
+        when not password_set()
+            give redirect("/", 302)
+        when not constant_time_eq(text(field(form of request, "password", "")), secret("CONSOLE_PASSWORD"))
+            give redirect("/login?err=wrong+password", 302)
+        let sid be token()
+        state_set("session:" + sid, {"operator": "signed in"})
+        give set_cookie(redirect("/", 302), "console", sid, {"max_age": 43200, "same_site": "Strict", "secure": false})
+    route "GET /" requires auth
         give overview(load(), text(field(query, "ok", "")), text(field(query, "err", "")))
-    route "POST /deploy"
+    route "POST /deploy" requires auth
         try
             give back("/", do_deploy(load()), "")
         recover err
             give back("/", "", "deploy failed: " + text(err))
-    route "POST /fund"
+    route "POST /fund" requires auth
         try
             give back("/", do_fund(load(), trim(text(field(form of request, "amount", "")))), "")
         recover err
             give back("/", "", "the deposit failed: " + text(err))
-    route "POST /bidders"
+    route "POST /bidders" requires auth
         let f be form of request
         try
             give back("/", do_bidder(load(), trim(text(field(f, "name", "a bidder"))), trim(text(field(f, "eth", "2"))), trim(text(field(f, "deposit", "1")))), "")
         recover err
             give back("/", "", "the bidder could not be set up: " + text(err))
-    route "POST /open"
+    route "POST /open" requires auth
         try
             give back("/", do_open(load(), form of request), "")
         recover err
             give back("/", "", "the auction could not be opened: " + text(err))
-    route "POST /auctions/:n/close"
+    route "POST /auctions/:n/close" requires auth
         try
             give back("/", do_close(load(), params.n, "close"), "")
         recover err
             give back("/", "", "the close failed: " + text(err))
-    route "POST /auctions/:n/cancel"
+    route "POST /auctions/:n/cancel" requires auth
         try
             give back("/", do_close(load(), params.n, "cancel"), "")
         recover err
             give back("/", "", "the cancel failed: " + text(err))
-    route "POST /withdraw"
+    route "POST /withdraw" requires auth
         let f be form of request
         try
-            give back("/", do_withdraw(load(), seller(), v.me(), text(field(f, "token", "eth")), trim(text(field(f, "amount", "")))), "")
+            let s be load()
+            give back("/", do_withdraw(s, p521_pair(s), seller(), v.me(), text(field(f, "token", "eth")), trim(text(field(f, "amount", "")))), "")
         recover err
             give back("/", "", "the withdrawal failed: " + text(err))
-    route "GET /bidders/:i"
+    route "GET /bidders/:i" requires auth
         let s be load()
         let b be find_bidder(s, params.i)
         when b == nothing
             give fail(404, "no such bidder")
         give bidder_page(s, b, params.i, text(field(query, "ok", "")), text(field(query, "err", "")))
-    route "POST /bidders/:i/bid"
+    route "POST /bidders/:i/bid" requires auth
         let s be load()
         let b be find_bidder(s, params.i)
         when b == nothing
@@ -491,7 +556,7 @@ serve on 8080
             give back("/bidders/" + params.i, do_bid(s, b, text(field(f, "auction", "")), trim(text(field(f, "quantity", ""))), trim(text(field(f, "total", "")))), "")
         recover err
             give back("/bidders/" + params.i, "", "the bid failed: " + text(err))
-    route "POST /bidders/:i/cancel"
+    route "POST /bidders/:i/cancel" requires auth
         let s be load()
         let b be find_bidder(s, params.i)
         when b == nothing
@@ -500,13 +565,13 @@ serve on 8080
             give back("/bidders/" + params.i, do_cancel_bid(s, b, text(field(form of request, "auction", ""))), "")
         recover err
             give back("/bidders/" + params.i, "", "the cancel failed: " + text(err))
-    route "POST /bidders/:i/withdraw"
+    route "POST /bidders/:i/withdraw" requires auth
         let s be load()
         let b be find_bidder(s, params.i)
         when b == nothing
             give fail(404, "no such bidder")
         let f be form of request
         try
-            give back("/bidders/" + params.i, do_withdraw(s, bidder_key(b), b["address"], text(field(f, "token", "eth")), trim(text(field(f, "amount", "")))), "")
+            give back("/bidders/" + params.i, do_withdraw(s, desk_pair(s, b), bidder_key(b), b["address"], text(field(f, "token", "eth")), trim(text(field(f, "amount", "")))), "")
         recover err
             give back("/bidders/" + params.i, "", "the withdrawal failed: " + text(err))

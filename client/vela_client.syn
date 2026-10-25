@@ -8,6 +8,7 @@
 --
 --   the public devnet (no Docker):
 --   synsema run vela_client.syn -- devnet [host]                       a token of your own from devnet.synsema.app, written to .env
+--   synsema run vela_client.syn -- account [host]                      another token, only printed: a second participant (a bidder, an auditor)
 --   synsema run vela_client.syn -- allow-token <address>               TokenAllowlist.addAllowedToken with the signing key (the admin: Anvil #0 on a devnet)
 --   synsema run vela_client.syn -- allow-authority <appId> <address>   DefaultAuthority.addAllowedAuthority — an auditor for your app
 --
@@ -40,7 +41,8 @@ require sign("VELA_USER_KEY")
 require sign("VELA_ADMIN_KEY")
 require random
 require time
-require file.read("*")
+require file.read("./**")
+require file.read("../build/*")
 require file.write(".env")
 require reveal("ecdh_keypair.private")
 
@@ -52,7 +54,7 @@ let DEANONYMIZATION be 2
 let ASSOCIATE_KEY be 3
 
 task usage()
-    print("usage: synsema run vela_client.syn -- devnet [host] | allow-token <address> | allow-authority <appId> <address> | fund <eth|token> <tokens> | open <asset> <quantity> <payment> [reserve] [uniform|pay_as_bid] | bid <n> <quantity> <total> | cancel-bid <n> | close <n> | cancel <n> | withdraw <eth|token> <tokens> [to] | auctions [n] | results [n] | audit ['<json>'] | pending <eth|token> <address> | claim-for <eth|token> <address> | token-balance <token> <address> | keys | address | tee | user-keys | user | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id> | register-for | send-for '<json>' [amount token] | events-for [n]")
+    print("usage: synsema run vela_client.syn -- devnet [host] | account [host] | allow-token <address> | allow-authority <appId> <address> | fund <eth|token> <tokens> | open <asset> <quantity> <payment> [reserve] [uniform|pay_as_bid] | bid <n> <quantity> <total> | cancel-bid <n> | close <n> | cancel <n> | withdraw <eth|token> <tokens> [to] | auctions [n] | results [n] | audit ['<json>'] | pending <eth|token> <address> | claim-for <eth|token> <address> | token-balance <token> <address> | keys | address | tee | user-keys | user | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id> | register-for | send-for '<json>' [amount token] | events-for [n]")
 
 task arg_or(a, i, default)
     give when length(a) > i then a[i] otherwise default
@@ -83,15 +85,16 @@ task auction_id(t)
         give lower(t)
     give v.hex_of(int_to_bytes(v.int_of(t), 16))
 
+-- Padded to 256 bytes before sealing: the size of a ciphertext is public (vela_lib.padded).
 task encrypted(c, plain)
-    give v.seal(v.derive_key(v.p521_key(), v.tee_public_key(c)), bytes(json_encode(plain)))
+    give v.seal(v.derive_key(v.p521_key(), v.tee_public_key(c)), bytes(json_encode(v.padded(plain, 256))))
 
 task instruct(c, plain)
     let id be v.submit(c, PROCESS, encrypted(c, plain), ETH, 0)
     print(plain["type"] + " submitted: " + id)
     let row be v.wait_completed(c, id, false)
     print("completed at block " + text(row["blockNumber"]) + ", fees " + text(row["applicationFees"]) + " wei")
-    give row
+    give id
 
 -- The price a (quantity, total) pair means, as payment per whole asset unit, for people.
 task price_of(c, asset, payment, quantity, total)
@@ -101,10 +104,23 @@ task price_of(c, asset, payment, quantity, total)
     let scaled be v.int_of(total) * v.int_of(v.to_units("1", ad))
     give v.from_units(text(v.div_floor(scaled, v.int_of(quantity))), pd)
 
+-- Padding is the policy's, not news: the events of type "pad" are skipped and the "_" filler
+-- that rounds every event to the same size is left out.
 task print_events(c, items)
     each item in items
-        when contains(item, "event") and contains(item["event"], "type")
-            print(json_encode(item["event"]))
+        when contains(item, "event") and contains(item["event"], "type") and item["event"]["type"] != "pad"
+            let e be item["event"]
+            when contains(e, "_")
+                set e to remove(e, "_")
+            print(json_encode(e))
+
+-- This account's events from one request (a close sends the seller its event among the padding).
+task print_own(c, id)
+    let mine be []
+    each item in v.my_events(c, 64)
+        when lower(text(item["request_id"])) == lower(id)
+            set mine to append(mine, item)
+    print_events(c, mine)
 
 task run_cli(a)
     when length(a) == 0
@@ -119,6 +135,11 @@ task run_cli(a)
             each k in keys(values)
                 print(k + "=" + text(values[k]))
             print("written to .env: a token of your own on " + host + " with an account of its own (ETH, DEPLOYER_ROLE, test tokens); allow-token / allow-authority go through its admin desk (VELA_ADMIN_URL)")
+        is "account"
+            -- A token of its own, printed and NOT written: another participant on the same devnet.
+            let values be v.devnet_env(arg_or(a, 1, "devnet.synsema.app"))
+            each k in keys(values)
+                print(k + "=" + text(values[k]))
         is "allow-token"
             let receipt be v.allow_token(c, lower(a[1]))
             print("token " + lower(a[1]) + " allowlisted (tx " + text(receipt["transactionHash"]) + ")")
@@ -139,8 +160,7 @@ task run_cli(a)
             let asset be token_of(a[1])
             let payment be token_of(a[3])
             let plain be {"type": "open", "asset": asset, "quantity": units(c, asset, a[2]), "payment": payment, "reserve": units(c, payment, arg_or(a, 4, "0")), "kind": arg_or(a, 5, "uniform")}
-            instruct(c, plain)
-            print_events(c, v.my_events(c, 1))
+            print_own(c, instruct(c, plain))
         is "bid"
             let id be auction_id(a[1])
             let au be find_public(c, id)
@@ -152,8 +172,7 @@ task run_cli(a)
         is "cancel-bid"
             instruct(c, {"type": "cancel_bid", "auction": auction_id(a[1])})
         is "close"
-            instruct(c, {"type": "close", "auction": auction_id(a[1])})
-            print_events(c, v.my_events(c, 1))
+            print_own(c, instruct(c, {"type": "close", "auction": auction_id(a[1])}))
         is "cancel"
             instruct(c, {"type": "cancel", "auction": auction_id(a[1])})
         is "withdraw"
@@ -323,6 +342,18 @@ test "an auction is named by number or id; tokens by `eth` or address"
     assert_eq(auction_id("0x000000000000000000000000000000FF"), "0x000000000000000000000000000000ff")
     assert_eq(token_of("eth"), ETH)
     assert_eq(token_of("0xA0B86991C6218B36C1D19D4A2E9EB0CE3606EB48"), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+
+test "every instruction is padded to the same 256 bytes, whatever its type or amounts"
+    let a be "0x00000000000000000000000000000001"
+    let t be "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    let all be [{"type": "open", "asset": t, "quantity": "1000000000", "payment": ETH, "reserve": "500000000000000000", "kind": "pay_as_bid"},
+                {"type": "bid", "auction": a, "quantity": "1", "total": "1"},
+                {"type": "bid", "auction": a, "quantity": "600000000000000000000", "total": "900000000000000000000000"},
+                {"type": "cancel_bid", "auction": a}, {"type": "close", "auction": a}, {"type": "cancel", "auction": a},
+                {"type": "withdraw", "token": t, "amount": "600000000", "to": t}]
+    each plain in all
+        assert_eq(length(bytes(json_encode(v.padded(plain, 256)))), 256)
+    assert_eq(json_decode(json_encode(v.padded({"type": "close"}, 256)))["type"], "close")
 
 test "human amounts become exact token units and back; exact division at any size"
     assert_eq(v.to_units("0.9", 18), "900000000000000000")
